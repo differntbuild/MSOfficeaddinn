@@ -1,0 +1,48 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+@keyframes bounce {
+  0%, 60%, 100% { transform: translateY(0); }
+  30% { transform: translateY(-4px); }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+body {
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-size: 13px;
+  background: #f8f8f8;
+}
+
+textarea:focus { outline: none; }
+button:focus { outline: none; }
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-thumb { background: #d0d0d0; border-radius: 4px; }
+
+/* Settings UI */
+.settings-section { margin-bottom: 24px; padding: 0 14px; }
+.settings-section-head { font-size: 11px; font-weight: 700; color: #217346; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+.settings-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 0.5px solid #f0f0f0; }
+.settings-row:last-child { border-bottom: none; }
+.settings-row-label { font-size: 13px; font-weight: 500; color: #201f1e; }
+.settings-row-sub { font-size: 11px; color: #605e5c; margin-top: 2px; }
+.settings-input { border: 1px solid #d0d0d0; border-radius: 4px; padding: 8px 10px; font-size: 12px; font-family: inherit; width: 100%; transition: border-color 0.2s; }
+.settings-input:focus { border-color: #217346; outline: none; }
+.settings-select { border: 1px solid #d0d0d0; border-radius: 4px; padding: 6px 8px; font-size: 12px; color: #201f1e; background: white; cursor: pointer; }
+.settings-tag { font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 10px; text-transform: uppercase; }
+.tag-connected { background: #e8f5ee; color: #217346; }
+.tag-pro { background: #fff4e5; color: #633806; }
+
+/* Toggle Switch */
+.toggle { width: 34px; height: 18px; border-radius: 10px; background: #c8c8c8; position: relative; cursor: pointer; transition: background 0.2s; flex-shrink: 0; }
+.toggle::after { content: ''; position: absolute; width: 14px; height: 14px; background: white; border-radius: 50%; top: 2px; left: 2px; transition: transform 0.2s; }
+.toggle.on { background: #217346; }
+.toggle.on::after { transform: translateX(16px); }
+
+/* Model Switcher Pill */
+.model-pill { display: flex; align-items: center; gap: 4px; padding: 4px 8px; background: #f3f3f3; border: 0.5px solid #d0d0d0; border-radius: 6px; cursor: pointer; transition: background 0.1s; }
+.model-pill:hover { background: #e8e8e8; }
+.model-pill-dot { width: 6px; height: 6px; border-radius: 50%; background: #217346; }
+.model-pill-label { font-size: 10px; font-weight: 600; color: #605e5c; }

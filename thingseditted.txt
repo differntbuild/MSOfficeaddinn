@@ -1,0 +1,5 @@
+src/taskpane/components/taskpane.css
+src/taskpane/components/Settings.jsx
+src/taskpane/components/ChatPane.jsx
+src/utils/intelligence.js
+these are for the model selector in the ChatPane

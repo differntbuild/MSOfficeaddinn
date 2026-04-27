@@ -1,0 +1,30 @@
+{
+  "name": "groqflow-ai",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "start": "office-addin-debugging start manifest.xml desktop",
+    "stop": "office-addin-debugging stop manifest.xml",
+    "dev": "vite",
+    "build": "vite build",
+    "validate": "office-addin-manifest validate manifest.xml"
+  },
+  "dependencies": {
+    "@fluentui/react-components": "*",
+    "@fluentui/react-icons": "*",
+    "react": "*",
+    "react-dom": "*",
+    "react-markdown": "*"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "*",
+    "office-addin-debugging": "*",
+    "office-addin-dev-certs": "*",
+    "office-addin-manifest": "*",
+    "vite": "*"
+  }
+}
