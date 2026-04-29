@@ -469,6 +469,40 @@ export const useOffice = () => {
     });
   }, []);
 
+  const deleteRows = useCallback(async (rangeAddress) => {
+    return await Excel.run(async (context) => {
+      const sheet = context.workbook.worksheets.getActiveWorksheet();
+      // rangeAddress can be a single row "A5:Z5" or "5:5".
+      // We will get the entire row and delete it.
+      const range = sheet.getRange(rangeAddress).getEntireRow();
+      
+      // Before deleting, load values so we can revert if needed
+      range.load(['values', 'address']);
+      await context.sync();
+      const originalValues = JSON.parse(JSON.stringify(range.values));
+      const address = range.address;
+
+      range.delete(Excel.DeleteShiftDirection.up);
+      await context.sync();
+      return { success: true, address, originalValues };
+    });
+  }, []);
+
+  const formatCells = useCallback(async (rangeAddress, formatOptions) => {
+    return await Excel.run(async (context) => {
+      const sheet = context.workbook.worksheets.getActiveWorksheet();
+      const range = sheet.getRange(rangeAddress);
+      
+      if (formatOptions.fill) range.format.fill.color = formatOptions.fill;
+      if (formatOptions.fontColor) range.format.font.color = formatOptions.fontColor;
+      if (formatOptions.bold !== undefined) range.format.font.bold = formatOptions.bold;
+      if (formatOptions.numberFormat) range.numberFormat = [[formatOptions.numberFormat]];
+
+      await context.sync();
+      return { success: true };
+    });
+  }, []);
+
   return {
     getSelectionContext,
     getFormulaAtCell,
@@ -483,6 +517,8 @@ export const useOffice = () => {
     navigateToCell,
     highlightCells,
     writeCellValue,
+    deleteRows,
+    formatCells,
     saveToWorkbookMemory,
     loadFromWorkbookMemory,
   };

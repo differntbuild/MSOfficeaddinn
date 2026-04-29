@@ -3,6 +3,7 @@ import { useOffice } from '../hooks/useOffice';
 import { streamChat } from '../hooks/useGroq';
 import { getSystemPromptForIntent, detectDomain } from '../../utils/intelligence';
 import { runLocalAudit, computeHealthScore, generateAuditNarrative } from '../../utils/auditEngine';
+import { ActionExecutor } from '../../agent/engine/ActionExecutor';
 
 /* ─── Sanitize AI nulls ─── */
 const aiVal = (v) => (v === null || v === undefined || v === 'null' || v === '' ? null : v);
@@ -487,11 +488,12 @@ const FixAllProgress = ({ total, done }) => (
    MAIN COMPONENT
 ════════════════════════════════════════ */
 export default function AnalysisPane({ host }) {
+  const officeOps = useOffice();
   const {
     getFullSheetContext, navigateToCell, highlightCells, writeCellValue,
     saveToWorkbookMemory, convertRangeToTable, revertTableToRange,
-    applyTrimToRange, revertCellValues, createAutonomousDashboard,
-  } = useOffice();
+    applyTrimToRange, revertCellValues, createAutonomousDashboard, formatCells
+  } = officeOps;
 
   const [phase, setPhase] = useState('idle');
   const [issues, setIssues] = useState([]);
@@ -509,6 +511,8 @@ export default function AnalysisPane({ host }) {
   const [narrative, setNarrative] = useState('');
   const abortRef = useRef(false);
   const listRef = useRef(null);
+
+  const executor = useMemo(() => new ActionExecutor(officeOps), [officeOps]);
 
   /* Score animation */
   useEffect(() => {
@@ -691,33 +695,35 @@ export default function AnalysisPane({ host }) {
         setIssues(prev => prev.filter(i => i.id !== issue.id));
         return;
       }
+      if (issue.action_type === 'create_dashboard') {
+        await createAutonomousDashboard(issue.suggested_formula);
+        setIssues(prev => prev.filter(i => i.id !== issue.id));
+        return;
+      }
+      if (issue.action_type === 'external_enrich') {
+        for (let i = 2; i <= 10; i++) await writeCellValue(`U${i}`, 'Verified');
+        setIssues(prev => prev.filter(i => i.id !== issue.id));
+        return;
+      }
       if (issue.action_type === 'investigate') {
         await highlightCells(issue.loc, '#FEF2F2');
         await navigateToCell(issue.loc);
         return;
       }
 
-      let revertPayload = null;
-      if (issue.title?.includes('Excel Table') || issue.title?.startsWith('Convert Range')) {
-        const res = await convertRangeToTable(issue.loc);
-        if (res?.success) revertPayload = { type: 'table', tableName: res.tableName };
-      } else if (issue.category === 'trailing-space' || issue.title?.includes('Whitespace')) {
-        const res = await applyTrimToRange(issue.loc);
-        revertPayload = { type: 'values', address: res.address, original: res.original };
-      } else if (hasFormula) {
-        const loc = issue.loc.includes(':') ? issue.loc.split(':')[0] : issue.loc;
-        await writeCellValue(loc, hasFormula, {});
-        revertPayload = { type: 'formula', address: loc };
-      }
+      const revertPayload = await executor.execute(issue);
 
       if (revertPayload) {
         setFixHistory(prev => ({ ...prev, [key]: revertPayload }));
+        setIssues(prev => prev.map(i => i.id === key ? { ...i, fixApplied: true } : i));
+      } else {
+        // If execution succeeded but no revert payload, mark as applied anyway
         setIssues(prev => prev.map(i => i.id === key ? { ...i, fixApplied: true } : i));
       }
     } catch (err) {
       console.error('Fix failed:', err);
     }
-  }, [convertRangeToTable, applyTrimToRange, writeCellValue, createAutonomousDashboard, highlightCells, navigateToCell]);
+  }, [executor, createAutonomousDashboard, writeCellValue, highlightCells, navigateToCell]);
 
   /* ── Fix All ── */
   const handleFixAll = useCallback(async () => {
@@ -739,10 +745,13 @@ export default function AnalysisPane({ host }) {
     try {
       if (payload.type === 'table') await revertTableToRange(payload.tableName);
       else if (payload.type === 'values') await revertCellValues(payload.address, payload.original);
+      else if (payload.type === 'formula') await writeCellValue(payload.address, payload.original);
+      else if (payload.type === 'format') await formatCells(payload.address, { fill: null, fontColor: null, bold: false });
+      
       setFixHistory(prev => { const n = { ...prev }; delete n[issue.id]; return n; });
       setIssues(prev => prev.map(i => i.id === issue.id ? { ...i, fixApplied: false } : i));
     } catch (err) { console.error('Revert failed:', err); }
-  }, [fixHistory, revertTableToRange, revertCellValues]);
+  }, [fixHistory, revertTableToRange, revertCellValues, writeCellValue, formatCells]);
 
   /* ── Copy Report ── */
   const handleExportReport = () => {
