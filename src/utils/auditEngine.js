@@ -76,6 +76,7 @@ function pruneNoisyColumns(data) {
 
 function pruneGhostRows(data, findings) {
   const prunedValues = [data.values[0]]; // keep header
+  const prunedFormulas = data.formulas ? [data.formulas[0]] : null;
   const ghostRows = [];
   
   for (let r = 1; r < data.rowCount; r++) {
@@ -90,6 +91,7 @@ function pruneGhostRows(data, findings) {
       ghostRows.push(r + 1); // 1-indexed row number
     } else {
       prunedValues.push(data.values[r]);
+      if (prunedFormulas) prunedFormulas.push(data.formulas[r]);
     }
   }
 
@@ -106,7 +108,7 @@ function pruneGhostRows(data, findings) {
     });
   }
 
-  return { ...data, values: prunedValues, rowCount: prunedValues.length };
+  return { ...data, values: prunedValues, formulas: prunedFormulas || data.formulas, rowCount: prunedValues.length };
 }
 
 function coalesceColumns(data, findings) {
@@ -139,9 +141,9 @@ function coalesceColumns(data, findings) {
     }
   }
 
-  const newValues = data.values.map(row => [...row]);
+  const newValues = data.values.map(row => row ? [...row] : []);
   const newHeaders = [...data.headers];
-  const newFormulas = data.formulas ? data.formulas.map(row => [...row]) : null;
+  const newFormulas = data.formulas ? data.formulas.map(row => row ? [...row] : []) : null;
 
   for (const [root, cols] of Object.entries(groups)) {
     if (cols.length > 1) {

@@ -170,14 +170,17 @@ export const useOffice = () => {
       
       await context.sync();
 
-      const headers = range.values[0] || [];
+      const vals = range.values || [];
+      const forms = range.formulas || [];
+      const headers = vals[0] || [];
       const columnTypes = [];
-      if (range.values.length > 1) {
+
+      if (vals.length > 1) {
         headers.forEach((h, i) => {
           let type = 'string';
           // Scan up to 5 rows to figure out the true data type, in case row 1 is empty
-          for (let r = 1; r < Math.min(6, range.values.length); r++) {
-            const val = range.values[r][i];
+          for (let r = 1; r < Math.min(6, vals.length); r++) {
+            const val = vals[r][i];
             if (val !== "" && val !== null) {
                if (typeof val === 'number') type = 'number';
                else if (val instanceof Date) type = 'date';
@@ -212,7 +215,7 @@ export const useOffice = () => {
         return stats;
       };
 
-      const stats = buildColumnStats(range.values);
+      const stats = buildColumnStats(vals);
 
       // Check if this range is already part of a Table
       let isTable = false;
@@ -229,8 +232,8 @@ export const useOffice = () => {
         sheetName: sheet.name,
         address: range.address,
         dimensions: `${range.rowCount} rows × ${range.columnCount} columns`,
-        values: range.values,
-        formulas: range.formulas,
+        values: vals,
+        formulas: forms,
         numberFormat: range.numberFormat,
         rowCount: range.rowCount,
         columnCount: range.columnCount,

@@ -56,7 +56,7 @@ export class ActionExecutor {
       switch (action) {
         case 'FIX_FORMULA':
           if (issue.suggested_formula) {
-            const singleLoc = loc.includes(':') ? loc.split(':')[0] : loc;
+            const singleLoc = (loc || '').includes(':') ? (loc || '').split(':')[0] : loc;
             
             // Try to capture original state for revert
             let original = '';
