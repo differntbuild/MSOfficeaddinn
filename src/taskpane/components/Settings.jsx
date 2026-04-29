@@ -3,7 +3,7 @@ import { getSettings, saveSettings } from '../../utils/storage';
 
 const Settings = () => {
   const [apiKey, setApiKey] = useState('');
-  const [model, setModel] = useState('groq/compound');
+  const [model, setModel] = useState('auto');
   const [temperature, setTemperature] = useState(0.7);
   const [isSaved, setIsSaved] = useState(false);
   const [toggles, setToggles] = useState({
@@ -24,11 +24,12 @@ const Settings = () => {
     const settings = getSettings();
     setModel(settings.model);
     setTemperature(settings.temperature);
+    setToggles(prev => ({ ...prev, ...(settings.toggles || {}) }));
   }, []);
 
   const handleSave = () => {
     localStorage.setItem('groq_api_key', apiKey);
-    saveSettings({ model, temperature });
+    saveSettings({ model, temperature, toggles });
     setIsSaved(true);
     setTimeout(() => setIsSaved(false), 2000);
   };
@@ -58,14 +59,12 @@ const Settings = () => {
               style={{ padding: '8px', cursor: 'pointer' }}
             >
               <optgroup label="Groq Optimization">
-                <option value="groq/compound">Groq Compound (New)</option>
+                <option value="auto">Auto (Intent-Based)</option>
+                <option value="groq/compound">Groq Compound</option>
               </optgroup>
               <optgroup label="Meta Llama">
-                <option value="llama-3.3-70b-versatile">Llama 3.3 70B (Versatile)</option>
-                <option value="llama-3.1-8b-instant">Llama 3.1 8B (Fast)</option>
-              </optgroup>
-              <optgroup label="Mixtral (Mistral AI)">
-                <option value="mixtral-8x7b-32768">Mixtral 8x7B (32k)</option>
+                <option value="llama-3.3-70b-versatile">Llama 3.3 70B</option>
+                <option value="meta-llama/llama-4-scout-17b-16e-instruct">Llama 4 Scout</option>
               </optgroup>
             </select>
           </div>
@@ -105,6 +104,20 @@ const Settings = () => {
               <div className="settings-row-sub">Allow AI to see names of other worksheets</div>
             </div>
             <div className={`toggle ${toggles.sheetNames ? 'on' : ''}`} onClick={() => toggle('sheetNames')}></div>
+          </div>
+          <div className="settings-row">
+            <div>
+              <div className="settings-row-label">Named Ranges</div>
+              <div className="settings-row-sub">Include named range metadata for context</div>
+            </div>
+            <div className={`toggle ${toggles.namedRanges ? 'on' : ''}`} onClick={() => toggle('namedRanges')}></div>
+          </div>
+          <div className="settings-row">
+            <div>
+              <div className="settings-row-label">Column Type Hints</div>
+              <div className="settings-row-sub">Send inferred data types to improve reasoning</div>
+            </div>
+            <div className={`toggle ${toggles.dataTypes ? 'on' : ''}`} onClick={() => toggle('dataTypes')}></div>
           </div>
         </div>
 

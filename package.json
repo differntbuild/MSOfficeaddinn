@@ -18,7 +18,9 @@
     "@fluentui/react-icons": "*",
     "react": "*",
     "react-dom": "*",
-    "react-markdown": "*"
+    "react-markdown": "*",
+    "zod": "^4.3.6",
+    "zod-to-json-schema": "^3.25.2"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "*",

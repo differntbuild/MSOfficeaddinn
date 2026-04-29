@@ -1,10 +1,30 @@
 import { getApiKey, getSettings } from '../../utils/storage';
 import { detectIntent } from '../../utils/intelligence';
 
-export const streamChat = async (prompt, contextData, systemMessage, onChunk) => {
+const MODELS = {
+  LLAMA_70B: 'llama-3.3-70b-versatile',
+  LLAMA_4_SCOUT: 'meta-llama/llama-4-scout-17b-16e-instruct',
+  GROQ_COMPOUND: 'groq/compound',
+};
+
+const resolveModelForIntent = (selectedModel, intent) => {
+  if (selectedModel && selectedModel !== 'auto') return selectedModel;
+
+  if (intent === 'AUDIT' || intent === 'FORMULA' || intent === 'PIVOT' || intent === 'METRICS') {
+    return MODELS.LLAMA_70B;
+  }
+  if (intent === 'DATA_CLEANING' || intent === 'CLASSIFICATION' || intent === 'COMPARISON') {
+    return MODELS.GROQ_COMPOUND;
+  }
+  return MODELS.LLAMA_4_SCOUT;
+};
+
+export const streamChat = async (prompt, contextData, systemMessage, onChunk, options = {}) => {
   const apiKey = getApiKey();
   const settings = getSettings();
-  const intent = detectIntent(prompt);
+  const intent = options.intent || detectIntent(prompt);
+  const isJson = options.isJson || false;
+  const resolvedModel = options.model || resolveModelForIntent(settings.model, intent);
 
   if (!apiKey) throw new Error("API Key missing! Add it in settings.");
 
@@ -22,12 +42,10 @@ ${JSON.stringify(contextData, null, 2)}
 
   const messages = isAudit
     ? [
-        // For audit: keep system message clean, put all data in user message
         { role: "system", content: systemMessage },
         { role: "user", content: `${prompt}\n\n${safeContext}` }
       ]
     : [
-        // For chat: context goes in system message as before
         {
           role: "system",
           content: `${systemMessage}\n\nIntent: ${intent}\n\nContext from document:\n${safeContext}`
@@ -35,19 +53,26 @@ ${JSON.stringify(contextData, null, 2)}
         { role: "user", content: prompt }
       ];
 
+  const body = {
+    model: resolvedModel,
+    temperature: (isAudit || isFormula || isJson) ? 0.1 : 0.7,
+    max_tokens: 4096,
+    messages,
+    stream: true
+  };
+
+  // Enable JSON mode if requested (Supported by Llama 3 on Groq)
+  if (isJson) {
+    body.response_format = { type: "json_object" };
+  }
+
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${apiKey}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      model: settings.model,
-      temperature: (isAudit || isFormula) ? 0.1 : 0.7,
-      max_tokens: 4096,
-      messages,
-      stream: true
-    })
+    body: JSON.stringify(body)
   });
 
   // Catch API-level errors before trying to stream

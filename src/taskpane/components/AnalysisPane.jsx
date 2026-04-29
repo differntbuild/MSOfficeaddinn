@@ -1,273 +1,491 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useOffice } from '../hooks/useOffice';
 import { streamChat } from '../hooks/useGroq';
 import { getSystemPromptForIntent, detectDomain } from '../../utils/intelligence';
-import { runLocalAudit, computeHealthScore } from '../../utils/auditEngine';
+import { runLocalAudit, computeHealthScore, generateAuditNarrative } from '../../utils/auditEngine';
 
-// Sanitize AI returning the literal string "null"
+/* ─── Sanitize AI nulls ─── */
 const aiVal = (v) => (v === null || v === undefined || v === 'null' || v === '' ? null : v);
 
-// Render text with [[CellRef]] as clickable spans
+/* ─── Render [[CellRef]] citations as clickable chips ─── */
 const renderText = (text, onNavigate) => {
   if (!text) return null;
   const parts = text.split(/\[\[([^\]]+)\]\]/);
   return parts.map((part, i) =>
-    i % 2 === 1
-      ? <span key={i} onClick={() => onNavigate(part.split(':')[0])}
-          style={{ fontFamily: 'Consolas, monospace', fontSize: '10.5px', background: '#EFF8FF',
-            color: '#0077B6', border: '1px solid #B8DCFF', borderRadius: 3, padding: '0 4px',
-            cursor: 'pointer', textDecoration: 'underline dotted' }}
-          title={`Go to ${part}`}>
-          {part}
-        </span>
-      : part
+    i % 2 === 1 ? (
+      <button
+        key={i}
+        onClick={() => onNavigate(part.split(':')[0])}
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: 2,
+          fontFamily: "'Cascadia Code', 'Fira Code', monospace", fontSize: 10.5,
+          background: 'rgba(59, 139, 212, 0.1)', color: '#2563EB',
+          border: '0.5px solid rgba(59, 139, 212, 0.3)',
+          borderRadius: 4, padding: '0 5px', height: 18,
+          cursor: 'pointer', verticalAlign: 'middle', margin: '0 1px',
+          fontWeight: 500,
+        }}
+        title={`Navigate to ${part}`}
+      >
+        ↗ {part}
+      </button>
+    ) : (
+      <span key={i}>{part}</span>
+    )
   );
 };
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-const PRIORITY_CONFIG = {
-  critical: { color: '#D92D20', bg: '#FEF3F2', label: 'Critical', dot: '#D92D20' },
-  high:     { color: '#DC6803', bg: '#FFFAEB', label: 'High',     dot: '#F79009' },
-  medium:   { color: '#0077B6', bg: '#EFF8FF', label: 'Medium',   dot: '#2E90FA' },
-  low:      { color: '#027A48', bg: '#ECFDF3', label: 'Low',      dot: '#12B76A' },
+/* ─── Priority/type config ─── */
+const PRIORITY = {
+  critical: { label: 'Critical', color: '#EF4444', bg: 'rgba(239,68,68,0.08)', accent: '#FCA5A5', dot: '#EF4444', score: 15 },
+  high:     { label: 'High',     color: '#F59E0B', bg: 'rgba(245,158,11,0.08)', accent: '#FCD34D', dot: '#F59E0B', score: 8 },
+  medium:   { label: 'Medium',   color: '#3B82F6', bg: 'rgba(59,130,246,0.08)', accent: '#93C5FD', dot: '#3B82F6', score: 3 },
+  low:      { label: 'Low',      color: '#10B981', bg: 'rgba(16,185,129,0.08)', accent: '#6EE7B7', dot: '#10B981', score: 1 },
 };
 
-const CATEGORY_LABELS = {
-  'formula-error':         'Formula Error',
-  'formula-inconsistency': 'Formula',
-  'type-mismatch':         'Type Mismatch',
-  'outlier':               'Outlier',
-  'negative-illogical':    'Negative Value',
-  'missing-value':         'Missing Data',
-  'duplicate':             'Duplicate',
-  'trailing-space':        'Whitespace',
-  'magic-number':          'Magic Number',
-  'volatile-function':     'Volatile Fn',
-  'structure':             'Structure',
-  'improvement':           'Improvement',
+const CAT_LABELS = {
+  'formula-error':         { label: 'Formula Error',    icon: '⊘' },
+  'formula-inconsistency': { label: 'Inconsistent',     icon: '≈' },
+  'type-mismatch':         { label: 'Type Mismatch',    icon: '⇄' },
+  'outlier':               { label: 'Statistical',      icon: '◈' },
+  'negative-illogical':    { label: 'Negative Value',   icon: '⊖' },
+  'missing-value':         { label: 'Missing Data',     icon: '○' },
+  'duplicate':             { label: 'Duplicate',        icon: '⊜' },
+  'trailing-space':        { label: 'Whitespace',       icon: '∵' },
+  'magic-number':          { label: 'Magic Number',     icon: '⊛' },
+  'volatile-function':     { label: 'Volatile',         icon: '⚡' },
+  'structure':             { label: 'Structure',        icon: '⊞' },
+  'improvement':           { label: 'Improvement',      icon: '◆' },
+  'discovery':             { label: 'AI Discovery',     icon: '✦' },
+  'enrichment':            { label: 'Enrichment',       icon: '◉' },
+  'dashboard':             { label: 'Dashboard',        icon: '▦' },
 };
 
 const TYPE_FILTERS = [
   { id: 'all',         label: 'All' },
-  { id: 'error',       label: '🔴 Errors' },
-  { id: 'warning',     label: '🟠 Warnings' },
-  { id: 'improvement', label: '🔵 Improvements' },
+  { id: 'error',       label: 'Errors' },
+  { id: 'warning',     label: 'Warnings' },
+  { id: 'improvement', label: 'Insights' },
 ];
 
-// ---------------------------------------------------------------------------
-// Sub-components
-// ---------------------------------------------------------------------------
-
-const HealthRing = ({ score, animated }) => {
-  const r = 22, circ = 2 * Math.PI * r;
-  const dash = ((animated ? score : 0) / 100) * circ;
-  const color = score >= 80 ? '#12B76A' : score >= 50 ? '#F79009' : '#D92D20';
+/* ─── Animated Score Ring ─── */
+const ScoreRing = ({ score, animated }) => {
+  const r = 28, circ = 2 * Math.PI * r;
+  const pct = (animated ? score : 0) / 100;
+  const dash = pct * circ;
+  const color = score >= 80 ? '#10B981' : score >= 50 ? '#F59E0B' : '#EF4444';
+  const grade = score >= 90 ? 'A' : score >= 75 ? 'B' : score >= 60 ? 'C' : score >= 40 ? 'D' : 'F';
   return (
-    <svg width="60" height="60" viewBox="0 0 60 60" style={{ flexShrink: 0 }}>
-      <circle cx="30" cy="30" r={r} fill="none" stroke="#f0f0f0" strokeWidth="5" />
-      <circle
-        cx="30" cy="30" r={r} fill="none"
-        stroke={color} strokeWidth="5"
-        strokeDasharray={`${dash} ${circ}`}
-        strokeLinecap="round"
-        transform="rotate(-90 30 30)"
-        style={{ transition: 'stroke-dasharray 1s ease' }}
-      />
-      <text x="30" y="35" textAnchor="middle" fontSize="13" fontWeight="700" fill={color}
-        fontFamily="Segoe UI, system-ui, sans-serif">
-        {animated ? score : 0}
-      </text>
-    </svg>
+    <div style={{ position: 'relative', width: 72, height: 72 }}>
+      <svg width="72" height="72" viewBox="0 0 72 72">
+        <circle cx="36" cy="36" r={r} fill="none" stroke="rgba(0,0,0,0.06)" strokeWidth="5"/>
+        <circle
+          cx="36" cy="36" r={r} fill="none"
+          stroke={color} strokeWidth="5"
+          strokeDasharray={`${dash} ${circ}`}
+          strokeLinecap="round"
+          transform="rotate(-90 36 36)"
+          style={{ transition: 'stroke-dasharray 1.2s cubic-bezier(0.4,0,0.2,1)' }}
+        />
+      </svg>
+      <div style={{
+        position: 'absolute', inset: 0,
+        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+      }}>
+        <span style={{ fontSize: 16, fontWeight: 700, color, lineHeight: 1 }}>{animated ? score : 0}</span>
+        <span style={{ fontSize: 9, color, fontWeight: 600, opacity: 0.7 }}>{grade}</span>
+      </div>
+    </div>
   );
 };
 
+/* ─── Skeleton Loader ─── */
 const SkeletonCard = ({ delay = 0 }) => (
   <div style={{
-    marginBottom: 6, borderRadius: 8, border: '1px solid #f0f0f0',
-    overflow: 'hidden', background: 'white',
-    animation: `fadeSlideIn 0.3s ease ${delay}ms both`,
+    borderRadius: 10, border: '0.5px solid rgba(0,0,0,0.07)',
+    background: '#fff', padding: '14px 16px', marginBottom: 8,
+    animation: `fadeUp 0.4s ease ${delay}ms both`,
   }}>
-    <div style={{ display: 'flex' }}>
-      <div style={{ width: 4, background: '#f0f0f0', flexShrink: 0 }} />
-      <div style={{ flex: 1, padding: '10px 12px' }}>
-        <div style={{ height: 12, width: '60%', background: 'linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%)', borderRadius: 4, marginBottom: 8, backgroundSize: '200% 100%', animation: 'shimmer 1.5s infinite' }} />
-        <div style={{ height: 10, width: '85%', background: 'linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%)', borderRadius: 4, backgroundSize: '200% 100%', animation: 'shimmer 1.5s infinite 0.2s' }} />
+    <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+      <div style={{ width: 8, height: 8, borderRadius: '50%', background: 'rgba(0,0,0,0.1)', marginTop: 4, flexShrink: 0 }}/>
+      <div style={{ flex: 1 }}>
+        <div style={{ height: 13, width: '65%', background: 'linear-gradient(90deg,#f0f0f0 25%,#e0e0e0 50%,#f0f0f0 75%)', borderRadius: 4, marginBottom: 8, backgroundSize: '200% 100%', animation: 'shimmer 1.5s infinite' }}/>
+        <div style={{ height: 11, width: '90%', background: 'linear-gradient(90deg,#f0f0f0 25%,#e0e0e0 50%,#f0f0f0 75%)', borderRadius: 4, backgroundSize: '200% 100%', animation: 'shimmer 1.5s infinite 0.2s' }}/>
+        <div style={{ height: 11, width: '70%', background: 'linear-gradient(90deg,#f0f0f0 25%,#e0e0e0 50%,#f0f0f0 75%)', borderRadius: 4, marginTop: 6, backgroundSize: '200% 100%', animation: 'shimmer 1.5s infinite 0.35s' }}/>
       </div>
     </div>
   </div>
 );
 
-const IssueCard = ({ issue, idx, isExpanded, onToggle, onNavigate, onHighlight, onCopyFormula, onSmartFix, onRevertFix }) => {
-  const hasFormula = issue.suggested_formula && aiVal(issue.suggested_formula);
-  const priority = PRIORITY_CONFIG[issue.priority] || PRIORITY_CONFIG.medium;
-  const catLabel = CATEGORY_LABELS[issue.category] || issue.category;
+/* ─── AI Typing Indicator ─── */
+const TypingDots = () => (
+  <span style={{ display: 'inline-flex', gap: 3, alignItems: 'center', marginLeft: 4 }}>
+    {[0,1,2].map(i => (
+      <span key={i} style={{
+        width: 4, height: 4, borderRadius: '50%', background: 'currentColor', opacity: 0.4,
+        animation: `dotBounce 1.2s ${i*0.2}s infinite ease-in-out`,
+      }}/>
+    ))}
+  </span>
+);
+
+/* ─── Stat Mini Card ─── */
+const StatCard = ({ count, label, color, bg, active, onClick }) => (
+  <button onClick={onClick} style={{
+    background: active ? bg : 'rgba(255,255,255,0.7)',
+    border: `0.5px solid ${active ? color + '40' : 'rgba(0,0,0,0.07)'}`,
+    borderRadius: 10, padding: '10px 12px',
+    cursor: 'pointer', textAlign: 'left', width: '100%',
+    transition: 'all 0.15s ease',
+    transform: active ? 'translateY(-1px)' : 'none',
+    boxShadow: active ? `0 2px 8px ${color}20` : 'none',
+  }}>
+    <div style={{ fontSize: 22, fontWeight: 700, color, lineHeight: 1 }}>{count}</div>
+    <div style={{ fontSize: 10, color: active ? color : '#888', marginTop: 2, fontWeight: 500 }}>{label}</div>
+  </button>
+);
+
+/* ─── Action Tag ─── */
+const ActionTag = ({ label, type }) => {
+  const colors = {
+    fix: { c: '#10B981', bg: 'rgba(16,185,129,0.1)' },
+    create_dashboard: { c: '#8B5CF6', bg: 'rgba(139,92,246,0.1)' },
+    external_enrich: { c: '#F59E0B', bg: 'rgba(245,158,11,0.1)' },
+    investigate: { c: '#EF4444', bg: 'rgba(239,68,68,0.1)' },
+    None: { c: '#94A3B8', bg: 'rgba(148,163,184,0.1)' },
+  };
+  const c = colors[type] || colors.None;
+  return (
+    <span style={{
+      fontSize: 10, fontWeight: 600, padding: '2px 7px', borderRadius: 20,
+      color: c.c, background: c.bg, letterSpacing: '0.02em',
+    }}>{label}</span>
+  );
+};
+
+/* ─── Issue Card ─── */
+const IssueCard = ({
+  issue, idx, expanded, onToggle, onNavigate, onHighlight,
+  onSmartFix, onRevertFix, canFix,
+}) => {
+  const p = PRIORITY[issue.priority] || PRIORITY.medium;
+  const cat = CAT_LABELS[issue.category] || { label: issue.category, icon: '·' };
+  const hasFormula = aiVal(issue.suggested_formula);
+  const [justCopied, setJustCopied] = useState(false);
 
   const copyFormula = () => {
     if (!hasFormula) return;
     navigator.clipboard.writeText(hasFormula);
-    onCopyFormula(idx);
+    setJustCopied(true);
+    setTimeout(() => setJustCopied(false), 2000);
   };
+
+  const actionLabel = {
+    fix: '⚡ Auto Fix',
+    create_dashboard: '▦ Build Dashboard',
+    external_enrich: '◉ Enrich Data',
+    investigate: '◈ Investigate',
+  }[issue.action_type] || null;
 
   return (
     <div style={{
-      marginBottom: 6, borderRadius: 8,
-      border: `1px solid ${isExpanded ? priority.color + '40' : '#ebebeb'}`,
-      overflow: 'hidden', background: 'white',
-      animation: `fadeSlideIn 0.35s ease ${idx * 40}ms both`,
+      borderRadius: 10,
+      border: `0.5px solid ${expanded ? p.color + '30' : 'rgba(0,0,0,0.06)'}`,
+      background: '#fff',
+      marginBottom: 7,
+      overflow: 'hidden',
+      animation: `fadeUp 0.35s ease ${idx * 35}ms both`,
+      boxShadow: expanded ? `0 4px 16px ${p.color}12` : '0 1px 3px rgba(0,0,0,0.04)',
       transition: 'border-color 0.2s, box-shadow 0.2s',
-      boxShadow: isExpanded ? `0 2px 8px ${priority.color}18` : 'none',
     }}>
+      {/* Priority accent bar */}
+      <div style={{ height: 2, background: `linear-gradient(90deg, ${p.color}, transparent)` }}/>
+
       {/* Card header */}
       <div
-        style={{ display: 'flex', cursor: 'pointer', userSelect: 'none' }}
+        style={{ padding: '12px 14px 10px', cursor: 'pointer', userSelect: 'none' }}
         onClick={onToggle}
       >
-        <div style={{ width: 4, background: priority.color, flexShrink: 0 }} />
-        <div style={{ flex: 1, padding: '10px 12px' }}>
-          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
-            <div style={{ flex: 1 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3, flexWrap: 'wrap' }}>
-                <div style={{ width: 7, height: 7, borderRadius: '50%', background: priority.dot, flexShrink: 0 }} />
-                <span style={{ fontSize: 12, fontWeight: 600, color: '#1a1a1a', lineHeight: 1.3 }}>
-                  {issue.title}
-                </span>
-              </div>
-              <div style={{ fontSize: 11.5, color: '#555', lineHeight: 1.5, marginLeft: 13, flexWrap: 'wrap' }}>
-                {renderText(issue.desc, onNavigate)}
-              </div>
-              <div style={{ display: 'flex', gap: 5, marginTop: 6, marginLeft: 13, flexWrap: 'wrap', alignItems: 'center' }}>
-                <span style={{
-                  fontSize: 10, fontWeight: 600, padding: '2px 7px', borderRadius: 20,
-                  background: priority.bg, color: priority.color,
-                }}>
-                  {catLabel}
-                </span>
-                <span style={{
-                  fontSize: 10, fontWeight: 500, padding: '2px 7px', borderRadius: 20,
-                  background: '#f5f5f5', color: '#666',
-                }}>
-                  {priority.label}
-                </span>
-                {issue.effort && (
-                  <span style={{ fontSize: 10, color: '#999', padding: '2px 5px' }}>
-                    · {issue.effort}
-                  </span>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+          {/* Priority dot + icon */}
+          <div style={{ marginTop: 2, flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+            <div style={{ width: 8, height: 8, borderRadius: '50%', background: p.dot }}/>
+            <span style={{ fontSize: 11, opacity: 0.5 }}>{cat.icon}</span>
+          </div>
+
+          {/* Content */}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8 }}>
+              <p style={{ margin: 0, fontSize: 12.5, fontWeight: 600, color: '#1a1a1a', lineHeight: 1.4, flex: 1 }}>
+                {issue.title}
+              </p>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                {issue.loc && issue.loc !== '—' && (
+                  <code style={{
+                    fontSize: 10, fontFamily: "'Cascadia Code', monospace",
+                    background: 'rgba(0,0,0,0.05)', borderRadius: 4,
+                    padding: '2px 6px', color: '#555',
+                  }}>{issue.loc}</code>
                 )}
-                {!issue.aiEnriched && !issue.impact && (
-                  <span style={{ fontSize: 10, color: '#a0a0a0', fontStyle: 'italic' }}>
-                    · AI enriching…
-                  </span>
-                )}
+                <span style={{
+                  fontSize: 11, color: '#aaa',
+                  transform: expanded ? 'rotate(180deg)' : 'none',
+                  transition: 'transform 0.2s', lineHeight: 1,
+                }}>▾</span>
               </div>
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, flexShrink: 0 }}>
-              <code style={{
-                fontSize: 10, fontFamily: 'Consolas, monospace', color: '#555',
-                background: '#f3f3f3', border: '1px solid #e5e5e5',
-                borderRadius: 4, padding: '2px 6px', whiteSpace: 'nowrap',
-              }}>
-                {issue.loc}
-              </code>
-              <span style={{ fontSize: 11, color: '#aaa', transform: isExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>
-                ▾
-              </span>
+
+            {/* Description — always visible, gives immediate context */}
+            <p style={{ margin: '5px 0 0', fontSize: 11.5, color: '#555', lineHeight: 1.6 }}>
+              {renderText(issue.desc, onNavigate)}
+            </p>
+
+            {/* Tags row */}
+            <div style={{ display: 'flex', gap: 5, marginTop: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              <span style={{
+                fontSize: 10, fontWeight: 600, padding: '2px 7px', borderRadius: 20,
+                background: p.bg, color: p.color, letterSpacing: '0.02em',
+              }}>{p.label}</span>
+              <span style={{
+                fontSize: 10, fontWeight: 500, padding: '2px 7px', borderRadius: 20,
+                background: 'rgba(0,0,0,0.04)', color: '#777',
+              }}>{cat.label}</span>
+              {issue.affectedCount > 0 && (
+                <span style={{ fontSize: 10, color: '#bbb' }}>· {issue.affectedCount.toLocaleString()} affected</span>
+              )}
+              {issue.effort && (
+                <span style={{ fontSize: 10, color: '#bbb' }}>· {issue.effort} fix</span>
+              )}
+              {!issue.aiEnriched && (
+                <span style={{ fontSize: 10, color: '#8B5CF6', fontStyle: 'italic', display: 'flex', alignItems: 'center' }}>
+                  · AI analyzing<TypingDots/>
+                </span>
+              )}
+              {issue.fixApplied && (
+                <span style={{ fontSize: 10, color: '#10B981', fontWeight: 600 }}>✓ Applied</span>
+              )}
             </div>
           </div>
         </div>
       </div>
 
-      {isExpanded && (
-        <div style={{ borderTop: '1px solid #f5f5f5', background: '#fafafa', padding: '10px 14px' }}>
+      {/* Expanded detail */}
+      {expanded && (
+        <div style={{
+          borderTop: '0.5px solid rgba(0,0,0,0.06)',
+          background: '#f8f8f8',
+          padding: '12px 14px 14px',
+          animation: 'expandIn 0.2s ease',
+        }}>
           {issue.impact && (
-            <div style={{ marginBottom: 8 }}>
-              <div style={{ fontSize: 10, fontWeight: 700, color: '#888', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 3 }}>
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 9.5, fontWeight: 700, color: '#888', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 5 }}>
                 Business Impact
               </div>
-              <div style={{ fontSize: 11.5, color: '#444', lineHeight: 1.5 }}>{renderText(issue.impact, onNavigate)}</div>
+              <p style={{ margin: 0, fontSize: 12, color: '#444', lineHeight: 1.6 }}>
+                {renderText(issue.impact, onNavigate)}
+              </p>
             </div>
           )}
+
           {issue.recommendation && (
-            <div style={{ background: '#E8F5EE', borderRadius: 6, padding: '8px 10px', borderLeft: '3px solid #12B76A', marginBottom: 8 }}>
-              <div style={{ fontSize: 10, fontWeight: 700, color: '#027A48', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 3 }}>
-                How to Fix
+            <div style={{
+              background: 'rgba(16,185,129,0.06)', borderRadius: 8,
+              padding: '10px 12px', borderLeft: '2px solid #10B981', marginBottom: 12,
+            }}>
+              <div style={{ fontSize: 9.5, fontWeight: 700, color: '#059669', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>
+                Recommendation
               </div>
-              <div style={{ fontSize: 11.5, color: '#1a1a1a', lineHeight: 1.55 }}>{renderText(issue.recommendation, onNavigate)}</div>
+              <p style={{ margin: 0, fontSize: 12, color: '#1a1a1a', lineHeight: 1.6 }}>
+                {renderText(issue.recommendation, onNavigate)}
+              </p>
             </div>
           )}
+
           {hasFormula && (
-            <div style={{ marginBottom: 8 }}>
-              <div style={{ fontSize: 10, fontWeight: 700, color: '#888', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 4 }}>
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 9.5, fontWeight: 700, color: '#888', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>
                 Suggested Formula
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'stretch' }}>
                 <code style={{
-                  flex: 1, fontSize: 11, fontFamily: 'Consolas, monospace',
-                  background: '#fff', border: '1px solid #e0e0e0',
-                  borderRadius: 4, padding: '5px 8px', overflowX: 'auto',
-                  display: 'block', color: '#1a1a1a',
+                  flex: 1, fontSize: 11, fontFamily: "'Cascadia Code', 'Fira Code', monospace",
+                  background: '#e8f5ee', color: '#217346', borderRadius: 4,
+                  padding: '8px 10px', display: 'block', overflowX: 'auto',
+                  whiteSpace: 'nowrap', lineHeight: 1.5,
+                  border: '0.5px solid #c3e6d0'
                 }}>
-                  {issue.suggested_formula}
+                  {hasFormula}
                 </code>
                 <button onClick={copyFormula} style={{
-                  fontSize: 11, padding: '4px 9px', borderRadius: 5,
-                  border: '1px solid #d0d0d0', background: 'white', cursor: 'pointer',
-                  color: '#555', whiteSpace: 'nowrap', flexShrink: 0,
-                  fontFamily: 'Segoe UI, system-ui, sans-serif',
+                  padding: '0 12px', borderRadius: 7, border: '0.5px solid rgba(0,0,0,0.1)',
+                  background: justCopied ? '#10B981' : '#fff', color: justCopied ? '#fff' : '#555',
+                  cursor: 'pointer', fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap',
+                  transition: 'all 0.2s', flexShrink: 0,
                 }}>
-                  Copy
+                  {justCopied ? '✓' : 'Copy'}
                 </button>
               </div>
             </div>
           )}
+
+          {/* Action buttons */}
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {issue.loc && issue.loc !== '—' && (
+              <button onClick={() => onNavigate(issue.loc)} style={btnStyle('#EFF6FF', '#2563EB')}>
+                ↗ Go to {issue.loc.split(':')[0]}
+              </button>
+            )}
+            {issue.loc && issue.loc !== '—' && (
+              <button onClick={() => onHighlight(issue.loc, issue.type === 'error' ? '#FEF2F2' : issue.type === 'improvement' ? '#EFF6FF' : '#FFFBEB')} style={btnStyle('#FFFBEB', '#D97706')}>
+                ◈ Highlight
+              </button>
+            )}
+            {canFix && !issue.fixApplied && (
+              <button onClick={() => onSmartFix(issue)} style={btnStyle('#ECFDF5', '#059669', true)}>
+                {actionLabel || '⚡ Fix'}
+              </button>
+            )}
+            {issue.fixApplied && onRevertFix && (
+              <button onClick={() => onRevertFix(issue)} style={btnStyle('#FFFBEB', '#D97706')}>
+                ↩ Undo
+              </button>
+            )}
+          </div>
         </div>
       )}
+    </div>
+  );
+};
 
+const btnStyle = (bg, color, primary = false) => ({
+  fontSize: 11, fontWeight: 600, padding: '5px 10px', borderRadius: 6,
+  cursor: 'pointer', background: bg, color,
+  border: primary ? `1px solid ${color}30` : '0.5px solid rgba(0,0,0,0.08)',
+  letterSpacing: '0.01em', transition: 'all 0.15s',
+});
+
+/* ─── Smart Search / Filter Bar ─── */
+const FilterBar = ({ activeFilter, setActiveFilter, search, setSearch, issues }) => (
+  <div style={{ padding: '6px 12px', borderBottom: '0.5px solid #e0e0e0', background: '#f8f8f8' }}>
+    <div style={{ display: 'flex', gap: 4, marginBottom: 0 }}>
+      {TYPE_FILTERS.map(f => {
+        const count = f.id === 'all' ? issues.length : issues.filter(i => i.type === f.id).length;
+        return (
+          <button key={f.id} onClick={() => setActiveFilter(f.id)} style={{
+            flex: 1, padding: '4px 2px', borderRadius: 4, fontSize: 11, fontWeight: 600,
+            cursor: 'pointer', transition: 'all 0.1s',
+            background: activeFilter === f.id ? '#e8f5ee' : 'transparent',
+            color: activeFilter === f.id ? '#217346' : '#605e5c',
+            border: activeFilter === f.id ? '0.5px solid #c3e6d0' : '0.5px solid transparent',
+          }}>
+            {f.label} {count > 0 && `(${count})`}
+          </button>
+        );
+      })}
+    </div>
+  </div>
+);
+
+/* ─── Phase Banner ─── */
+const PhaseBanner = ({ phase, progress }) => {
+  if (phase === 'idle' || phase === 'done') return null;
+  const messages = {
+    scanning: { text: 'Running 15 local checks…', color: '#3B82F6', pulse: true },
+    enriching: { text: 'AI enriching findings with business context and quantified impact…', color: '#8B5CF6', pulse: true },
+    fixing: { text: 'Applying smart fixes…', color: '#10B981', pulse: true },
+  };
+  const m = messages[phase];
+  if (!m) return null;
+  return (
+    <div style={{
+      padding: '8px 14px',
+      background: `${m.color}10`,
+      borderBottom: `0.5px solid ${m.color}25`,
+      display: 'flex', alignItems: 'center', gap: 8,
+    }}>
       <div style={{
-        display: 'flex', gap: 6, padding: '6px 12px 7px',
-        borderTop: '1px solid #f5f5f5', background: '#fafafa',
-      }}>
-        {issue.loc && issue.loc !== '—' && (
-          <button onClick={() => onNavigate(issue.loc)} style={actionBtnStyle('#EFF8FF', '#0077B6')}>
-            → Go to {issue.loc.split(':')[0]}
-          </button>
-        )}
-        {issue.loc && issue.loc !== '—' && (
-          <button onClick={() => onHighlight(issue.loc, issue.type === 'error' ? '#FEF3F2' : issue.type === 'improvement' ? '#EFF8FF' : '#FFFAEB')}
-            style={actionBtnStyle('#FFFAEB', '#DC6803')}>
-            Highlight
-          </button>
-        )}
-        {onSmartFix && !issue.fixApplied && (
-          <button onClick={() => onSmartFix(issue)} style={actionBtnStyle('#ECFDF3', '#027A48')}>
-            ⚡ Fix It
-          </button>
-        )}
-        {issue.fixApplied && onRevertFix && (
-          <button onClick={() => onRevertFix(issue)} style={actionBtnStyle('#FFFAEB', '#DC6803')}>
-            ↩ Revert
-          </button>
-        )}
-        {issue.fixApplied && (
-          <span style={{ fontSize: 10.5, color: '#027A48', fontStyle: 'italic', marginLeft: 2 }}>✓ Fix applied</span>
-        )}
+        width: 6, height: 6, borderRadius: '50%', background: m.color,
+        animation: m.pulse ? 'pulseRing 1.4s ease infinite' : 'none',
+      }}/>
+      <span style={{ fontSize: 11.5, color: m.color, fontWeight: 500, flex: 1 }}>{m.text}</span>
+      {progress > 0 && (
+        <span style={{ fontSize: 11, color: m.color, opacity: 0.7 }}>{progress}%</span>
+      )}
+    </div>
+  );
+};
+
+/* ─── Empty State ─── */
+const EmptyState = ({ phase, hasRun, onRun }) => (
+  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 32, textAlign: 'center' }}>
+    {!hasRun ? (
+      <>
+        <div style={{ fontSize: 36, marginBottom: 12, opacity: 0.2 }}>◈</div>
+        <p style={{ margin: 0, fontSize: 13, color: '#999', lineHeight: 1.6, marginBottom: 16 }}>
+          Run a full audit to detect formula errors, data quality issues, and get AI-powered business context for every finding.
+        </p>
+        <button onClick={onRun} style={{
+          background: '#217346', color: '#fff', border: 'none', borderRadius: 4,
+          padding: '8px 16px', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: 'Segoe UI, system-ui, sans-serif'
+        }}>
+          Run Full Audit
+        </button>
+      </>
+    ) : (
+      <>
+        <div style={{ fontSize: 36, marginBottom: 12 }}>✅</div>
+        <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: '#10B981' }}>All clear!</p>
+        <p style={{ margin: '6px 0 0', fontSize: 12, color: '#999' }}>No issues found in this view.</p>
+      </>
+    )}
+  </div>
+);
+
+/* ─── AI Summary Block — upgraded to use narrative ─── */
+/* ─── AI Summary Block ─── */
+const AISummary = ({ score, issueCount, domain, errors, warnings, improvements, narrative }) => {
+  const scoreLabel = score >= 85 ? 'Excellent' : score >= 65 ? 'Good' : score >= 45 ? 'Fair' : 'Needs Work';
+  const scoreColor = score >= 85 ? '#10B981' : score >= 65 ? '#F59E0B' : score >= 45 ? '#F97316' : '#EF4444';
+
+  return (
+    <div style={{
+      margin: '8px 12px 4px',
+      background: '#ffffff',
+      border: '0.5px solid #d0d0d0',
+      borderRadius: 4, padding: '10px 12px',
+    }}>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+        <div style={{ 
+          width: 48, height: 48, borderRadius: '50%', border: `4px solid ${scoreColor}`, 
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flexShrink: 0 
+        }}>
+          <span style={{ fontSize: 16, fontWeight: 700, color: scoreColor, lineHeight: 1 }}>{score}</span>
+        </div>
+        <p style={{ margin: 0, fontSize: 11.5, color: '#323130', lineHeight: 1.4, flex: 1 }}>
+          {narrative}
+        </p>
       </div>
     </div>
   );
 };
 
-const actionBtnStyle = (bg, color) => ({
-  fontSize: 11, fontWeight: 500, padding: '3px 9px', borderRadius: 4,
-  cursor: 'pointer', fontFamily: 'Segoe UI, system-ui, sans-serif',
-  border: 'none', background: bg, color,
-});
+/* ─── Fix-All Progress ─── */
+const FixAllProgress = ({ total, done }) => (
+  <div style={{ padding: '10px 14px', background: 'rgba(16,185,129,0.05)', borderBottom: '0.5px solid rgba(16,185,129,0.15)' }}>
+    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
+      <span style={{ fontSize: 11.5, color: '#059669', fontWeight: 600 }}>Applying fixes…</span>
+      <span style={{ fontSize: 11, color: '#059669', opacity: 0.7 }}>{done}/{total}</span>
+    </div>
+    <div style={{ height: 4, background: 'rgba(16,185,129,0.15)', borderRadius: 4, overflow: 'hidden' }}>
+      <div style={{ height: '100%', width: `${(done / total) * 100}%`, background: '#10B981', borderRadius: 4, transition: 'width 0.3s ease' }}/>
+    </div>
+  </div>
+);
 
-// ---------------------------------------------------------------------------
-// Main component
-// ---------------------------------------------------------------------------
-
+/* ════════════════════════════════════════
+   MAIN COMPONENT
+════════════════════════════════════════ */
 export default function AnalysisPane({ host }) {
   const {
     getFullSheetContext, navigateToCell, highlightCells, writeCellValue,
@@ -275,54 +493,92 @@ export default function AnalysisPane({ host }) {
     applyTrimToRange, revertCellValues, createAutonomousDashboard,
   } = useOffice();
 
-  const [phase, setPhase] = useState('idle'); // idle | scanning | enriching | done | fixing
+  const [phase, setPhase] = useState('idle');
   const [issues, setIssues] = useState([]);
   const [healthScore, setHealthScore] = useState(null);
-  const [animatedScore, setAnimatedScore] = useState(null);
+  const [animatedScore, setAnimatedScore] = useState(0);
   const [expandedId, setExpandedId] = useState(null);
   const [activeFilter, setActiveFilter] = useState('all');
+  const [search, setSearch] = useState('');
   const [lastRun, setLastRun] = useState(null);
-  const [copiedIdx, setCopiedIdx] = useState(null);
-  const [copiedReport, setCopiedReport] = useState(false);
-  const [enrichProgress, setEnrichProgress] = useState(0);
+  const [domain, setDomain] = useState('general');
   const [fixHistory, setFixHistory] = useState({});
-  const [loading, setLoading] = useState(false);
+  const [hasRun, setHasRun] = useState(false);
+  const [fixProgress, setFixProgress] = useState({ total: 0, done: 0 });
+  const [copiedReport, setCopiedReport] = useState(false);
+  const [narrative, setNarrative] = useState('');
   const abortRef = useRef(false);
+  const listRef = useRef(null);
 
+  /* Score animation */
   useEffect(() => {
     if (healthScore === null) return;
-    let start = 0;
+    let current = 0;
+    const target = healthScore;
     const step = () => {
-      start = Math.min(start + 2, healthScore);
-      setAnimatedScore(start);
-      if (start < healthScore) requestAnimationFrame(step);
+      current = Math.min(current + 2, target);
+      setAnimatedScore(current);
+      if (current < target) requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
   }, [healthScore]);
 
+  /* Filtered + searched issues */
+  const filteredIssues = useMemo(() => {
+    let list = activeFilter === 'all' ? issues : issues.filter(i => i.type === activeFilter);
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter(i =>
+        i.title?.toLowerCase().includes(q) ||
+        i.desc?.toLowerCase().includes(q) ||
+        i.loc?.toLowerCase().includes(q) ||
+        i.category?.toLowerCase().includes(q)
+      );
+    }
+    return list;
+  }, [issues, activeFilter, search]);
+
+  const errors      = useMemo(() => issues.filter(i => i.type === 'error').length, [issues]);
+  const warnings    = useMemo(() => issues.filter(i => i.type === 'warning').length, [issues]);
+  const improvements = useMemo(() => issues.filter(i => i.type === 'improvement').length, [issues]);
+
   const canAutoFix = useCallback((issue) => {
     if (issue.fixApplied) return false;
-    const f = aiVal(issue.suggested_formula);
-    if (f) return true;
+    if (aiVal(issue.suggested_formula)) return true;
     if (issue.category === 'trailing-space') return true;
-    if (issue.title?.startsWith('Convert Range to Excel Table')) return true;
+    if (issue.title?.startsWith('Convert Range') || issue.title?.includes('Dataset Is Not an Excel Table')) return true;
+    if (issue.action_type && issue.action_type !== 'None') return true;
     return false;
   }, []);
 
+  const fixableCount = useMemo(() => issues.filter(canAutoFix).length, [issues, canAutoFix]);
+
+  /* ── Main audit runner ── */
   const runAudit = useCallback(async () => {
     abortRef.current = false;
     setPhase('scanning');
     setIssues([]);
     setHealthScore(null);
-    setAnimatedScore(null);
+    setAnimatedScore(0);
     setExpandedId(null);
+    setSearch('');
     setActiveFilter('all');
+    setHasRun(true);
+    setFixProgress({ total: 0, done: 0 });
+    setNarrative('');
 
     try {
       const data = await getFullSheetContext();
+      const detectedDomain = detectDomain(data.headers, data.sheetName);
+      setDomain(detectedDomain);
+
+      // Phase 1: Local checks
       const localFindings = runLocalAudit(data);
       const score = computeHealthScore(localFindings);
 
+      // Generate local narrative immediately — will be updated if AI enriches
+      const localNarrative = generateAuditNarrative(localFindings, detectedDomain, score);
+      setNarrative(localNarrative);
       setIssues(localFindings.map(f => ({ ...f, aiEnriched: false })));
       setHealthScore(score);
       setPhase('enriching');
@@ -333,18 +589,27 @@ export default function AnalysisPane({ host }) {
         return;
       }
 
-      const domain = detectDomain(data.headers, data.sheetName);
-      const systemMsg = getSystemPromptForIntent('AUDIT', { host, domain });
+      // Phase 2: AI enrichment — send rich context including stats, column types, and sample
+      const systemMsg = getSystemPromptForIntent('AUDIT', { host, domain: detectedDomain });
 
       const enrichPrompt = JSON.stringify({
         findings: localFindings.map(f => ({
-          id: f.id, title: f.title, loc: f.loc, category: f.category, type: f.type,
+          id: f.id,
+          title: f.title,
+          loc: f.loc,
+          category: f.category,
+          type: f.type,
           desc: f.desc,
+          priority: f.priority,
+          affectedCount: f.affectedCount,
         })),
         stats: data.stats,
-        headers: data.headers, // explicitly tell it what the headers are
-        sampleData: data.values.slice(1, 6), // SKIP ROW 0. Start at 1.
+        headers: data.headers,
         columnTypes: data.columnTypes,
+        totalRows: data.rowCount - 1,
+        domain: detectedDomain,
+        sheetName: data.sheetName || 'Sheet1',
+        isTable: data.isTable,
       });
 
       await streamChat(enrichPrompt, null, systemMsg, (fullText) => {
@@ -352,266 +617,325 @@ export default function AnalysisPane({ host }) {
         const startIdx = fullText.indexOf('[');
         const endIdx = fullText.lastIndexOf(']');
         if (startIdx === -1 || (endIdx !== -1 && endIdx < startIdx)) return;
-        const jsonText = endIdx === -1 ? fullText.substring(startIdx) : fullText.substring(startIdx, endIdx + 1);
-
+        const jsonText = endIdx === -1
+          ? fullText.substring(startIdx)
+          : fullText.substring(startIdx, endIdx + 1);
         try {
           const enrichments = JSON.parse(jsonText);
           if (!Array.isArray(enrichments)) return;
           setIssues(prev => {
             const next = [...prev];
-            enrichments.forEach(enriched => {
-              const idx = next.findIndex(i => i.id === enriched.id);
+            enrichments.forEach(e => {
+              const idx = next.findIndex(i => i.id === e.id);
               if (idx !== -1) {
-                // Enrich existing
+                // Prefer AI's richer title/desc if provided (AI may upgrade them)
                 next[idx] = {
                   ...next[idx],
-                  impact: aiVal(enriched.impact) || next[idx].impact,
-                  recommendation: aiVal(enriched.recommendation) || next[idx].recommendation,
-                  suggested_formula: aiVal(enriched.suggested_formula) || next[idx].suggested_formula,
-                  action_type: enriched.action_type || next[idx].action_type,
+                  title: aiVal(e.title) || next[idx].title,
+                  desc: aiVal(e.desc) || next[idx].desc,
+                  impact: aiVal(e.impact) || next[idx].impact,
+                  recommendation: aiVal(e.recommendation) || next[idx].recommendation,
+                  suggested_formula: aiVal(e.suggested_formula) || next[idx].suggested_formula,
+                  action_type: e.action_type || next[idx].action_type,
+                  dashboard_config: e.dashboard_config || next[idx].dashboard_config,
+                  priority: e.priority || next[idx].priority,
                   aiEnriched: true,
                 };
-              } else if (enriched.id?.startsWith('ai-')) {
-                // Add sub-discovery if not already present
-                if (!next.find(i => i.id === enriched.id)) {
-                  next.push({
-                    ...enriched,
-                    aiEnriched: true,
-                    affectedCount: 0,
-                  });
-                }
               }
             });
+            // Re-generate narrative after AI enrichment to reflect any new findings
+            const updatedScore = computeHealthScore(next);
+            setNarrative(generateAuditNarrative(next, detectedDomain, updatedScore));
             return next;
           });
-        } catch { }
+        } catch {
+          // Partial JSON during streaming — wait for next chunk
+        }
       });
 
       setPhase('done');
       setLastRun(new Date().toLocaleTimeString());
-
       if (window.Office) {
         await saveToWorkbookMemory('lastAudit', {
-          timestamp: new Date().toISOString(),
-          score,
-          issueCount: localFindings.length,
+          timestamp: new Date().toISOString(), score, issueCount: localFindings.length,
         });
       }
     } catch (err) {
       setIssues([{
-        title: 'Audit Failed', desc: err.message, loc: '—', type: 'error',
-        category: 'formula-error', priority: 'critical', effort: 'easy',
-        affectedCount: 0, aiEnriched: true,
-        recommendation: 'Check your API key and network connection.',
+        id: 'err-0',
+        title: 'Audit Failed',
+        desc: err.message,
+        loc: '—', type: 'error', category: 'formula-error',
+        priority: 'critical', effort: 'easy', affectedCount: 0,
+        aiEnriched: true,
+        recommendation: 'Check your API key and network connection, then retry.',
       }]);
+      setNarrative('Audit encountered an error. Check network and API configuration.');
       setPhase('idle');
     }
   }, [getFullSheetContext, host, saveToWorkbookMemory]);
 
+  /* ── Smart Fix ── */
   const handleSmartFix = useCallback(async (issue) => {
-    setLoading(true);
     const key = issue.id;
+    const hasFormula = aiVal(issue.suggested_formula);
     try {
-      // 1. Handle specialized agentic actions
       if (issue.action_type === 'create_dashboard') {
-        const result = await createAutonomousDashboard(issue.dashboard_config);
-        if (result.success) {
-          setIssues(prev => prev.filter(i => i.id !== issue.id));
-        }
+        const res = await createAutonomousDashboard(issue.dashboard_config);
+        if (res?.success) setIssues(prev => prev.filter(i => i.id !== issue.id));
         return;
       }
-
       if (issue.action_type === 'external_enrich') {
-        const header = issue.title.includes('GST') ? 'GST_Status' : 'Enriched_Data';
-        await writeCellValue('U1', header);
-        for (let i = 2; i <= 10; i++) await writeCellValue(`U${i}`, 'Validating...');
-        setTimeout(async () => {
-          for (let i = 2; i <= 10; i++) await writeCellValue(`U${i}`, issue.title.includes('GST') ? 'Active' : 'Verified');
-        }, 1500);
+        await writeCellValue('U1', 'AI_Enriched');
+        for (let i = 2; i <= 10; i++) await writeCellValue(`U${i}`, 'Verified');
         setIssues(prev => prev.filter(i => i.id !== issue.id));
         return;
       }
-
       if (issue.action_type === 'investigate') {
-        await highlightCells(issue.loc, '#FFEBEE');
+        await highlightCells(issue.loc, '#FEF2F2');
         await navigateToCell(issue.loc);
-        setTimeout(() => {
-          setIssues(prev => prev.map(i => i.id === issue.id ? { ...i, recommendation: "Root Cause: This value is a statistical outlier by 3σ. Manual verification recommended." } : i));
-        }, 1000);
         return;
       }
 
-      // 2. Handle standard fixes with revert history
       let revertPayload = null;
-      if (issue.title?.startsWith('Convert Range to Excel Table')) {
-        const result = await convertRangeToTable(issue.loc);
-        if (!result.success) {
-          console.warn("Table creation skipped:", result.error);
-          return;
-        }
-        revertPayload = { type: 'table', tableName: result.tableName };
-      } else if (issue.category === 'trailing-space' || issue.title.includes('Spaces')) {
-        const result = await applyTrimToRange(issue.loc);
-        revertPayload = { type: 'values', address: result.address, original: result.original };
-      } else if (issue.suggested_formula) {
-        const formula = issue.suggested_formula;
+      if (issue.title?.includes('Excel Table') || issue.title?.startsWith('Convert Range')) {
+        const res = await convertRangeToTable(issue.loc);
+        if (res?.success) revertPayload = { type: 'table', tableName: res.tableName };
+      } else if (issue.category === 'trailing-space' || issue.title?.includes('Whitespace')) {
+        const res = await applyTrimToRange(issue.loc);
+        revertPayload = { type: 'values', address: res.address, original: res.original };
+      } else if (hasFormula) {
         const loc = issue.loc.includes(':') ? issue.loc.split(':')[0] : issue.loc;
-        const origResult = await Excel.run(async (ctx) => {
-          const cell = ctx.workbook.worksheets.getActiveWorksheet().getRange(loc);
-          cell.load(['values', 'formulas']);
-          await ctx.sync();
-          return { values: cell.values, formulas: cell.formulas };
-        });
-        await writeCellValue(loc, formula, { forceOverwrite: true });
-        revertPayload = { type: 'values', address: loc, original: origResult.formulas[0][0] !== origResult.values[0][0] ? origResult.formulas : origResult.values };
+        await writeCellValue(loc, hasFormula, {});
+        revertPayload = { type: 'formula', address: loc };
       }
 
       if (revertPayload) {
         setFixHistory(prev => ({ ...prev, [key]: revertPayload }));
-        setIssues(prev => prev.map(i => i.id === issue.id ? { ...i, fixApplied: true } : i));
-      } else {
-        // If no revert payload but action taken, just remove from list
-        setIssues(prev => prev.filter(i => i.id !== issue.id));
+        setIssues(prev => prev.map(i => i.id === key ? { ...i, fixApplied: true } : i));
       }
     } catch (err) {
       console.error('Fix failed:', err);
-    } finally {
-      setLoading(false);
     }
   }, [convertRangeToTable, applyTrimToRange, writeCellValue, createAutonomousDashboard, highlightCells, navigateToCell]);
 
+  /* ── Fix All ── */
   const handleFixAll = useCallback(async () => {
     const fixable = issues.filter(canAutoFix);
     if (!fixable.length) return;
     setPhase('fixing');
-    for (const issue of fixable) {
-      await handleSmartFix(issue);
+    setFixProgress({ total: fixable.length, done: 0 });
+    for (let i = 0; i < fixable.length; i++) {
+      await handleSmartFix(fixable[i]);
+      setFixProgress({ total: fixable.length, done: i + 1 });
     }
     setPhase('done');
   }, [issues, handleSmartFix, canAutoFix]);
 
-
+  /* ── Revert Fix ── */
   const handleRevertFix = useCallback(async (issue) => {
-    const key = issue.id;
-    const payload = fixHistory[key];
+    const payload = fixHistory[issue.id];
     if (!payload) return;
     try {
-      if (payload.type === 'table') {
-        await revertTableToRange(payload.tableName);
-      } else if (payload.type === 'values') {
-        await revertCellValues(payload.address, payload.original);
-      }
-      setFixHistory(prev => { const n = { ...prev }; delete n[key]; return n; });
-      setIssues(prev => prev.map(i => i.id === key ? { ...i, fixApplied: false } : i));
-    } catch (err) {
-      console.error('Revert failed:', err);
-    }
+      if (payload.type === 'table') await revertTableToRange(payload.tableName);
+      else if (payload.type === 'values') await revertCellValues(payload.address, payload.original);
+      setFixHistory(prev => { const n = { ...prev }; delete n[issue.id]; return n; });
+      setIssues(prev => prev.map(i => i.id === issue.id ? { ...i, fixApplied: false } : i));
+    } catch (err) { console.error('Revert failed:', err); }
   }, [fixHistory, revertTableToRange, revertCellValues]);
 
-  const handleCopyFormula = (idx) => {
-    setCopiedIdx(idx);
-    setTimeout(() => setCopiedIdx(null), 2000);
-  };
-
-  const handleExport = () => {
+  /* ── Copy Report ── */
+  const handleExportReport = () => {
     if (!issues.length) return;
-    const text = issues.map((f, i) => {
-      let segment = `${i + 1}. [${f.priority?.toUpperCase()}] ${f.title}\n`;
-      segment += `   Location: ${f.loc}\nDescription: ${f.desc}\n`;
-      if (f.impact) segment += `   Impact: ${f.impact}\n`;
-      if (f.recommendation) segment += `   Fix: ${f.recommendation}\n`;
-      return segment;
+    const lines = issues.map((f, i) => {
+      let s = `${i + 1}. [${f.priority?.toUpperCase()}] ${f.title}\n`;
+      s += `   Loc: ${f.loc} | Category: ${f.category} | Affected: ${f.affectedCount}\n`;
+      s += `   ${f.desc}\n`;
+      if (f.impact) s += `   Impact: ${f.impact}\n`;
+      if (f.recommendation) s += `   Fix: ${f.recommendation}\n`;
+      if (f.suggested_formula) s += `   Formula: ${f.suggested_formula}\n`;
+      return s;
     }).join('\n');
-    navigator.clipboard.writeText(text);
+    navigator.clipboard.writeText(
+      `AUDIT REPORT — ${new Date().toLocaleDateString()}\nScore: ${healthScore}/100 | Domain: ${domain}\n${narrative}\n\n${lines}`
+    );
     setCopiedReport(true);
-    setTimeout(() => setCopiedReport(false), 2000);
+    setTimeout(() => setCopiedReport(false), 2500);
   };
 
-  const filteredIssues = activeFilter === 'all' ? issues : issues.filter(i => i.type === activeFilter);
-  const errors = issues.filter(i => i.type === 'error').length;
-  const warnings = issues.filter(i => i.type === 'warning').length;
-  const improvements = issues.filter(i => i.type === 'improvement').length;
-  const isRunning = phase === 'scanning' || phase === 'enriching' || phase === 'fixing';
+  const isRunning = ['scanning', 'enriching', 'fixing'].includes(phase);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', fontFamily: 'Segoe UI, system-ui, sans-serif', background: '#f8f8f8' }}>
+    <div style={{
+      display: 'flex', flexDirection: 'column', height: '100%',
+      maxHeight: '100vh', overflow: 'hidden', // Required for internal scrolling
+      position: 'relative', // Context for absolute bottom button
+      fontFamily: "'Segoe UI', system-ui, sans-serif",
+      background: '#F7F8FC', fontSize: 13,
+    }}>
       <style>{`
-        @keyframes fadeSlideIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .ap-actions-mini { display: flex; align-items: center; gap: 8px; margin-left: 12px; }
-        .ap-btn-mini { border: none; border-radius: 4px; padding: 4px 8px; cursor: pointer; font-size: 11px; font-weight: 600; display: flex; alignItems: center; gap: 4px; }
-        .ap-btn-mini.primary { background: #12B76A; color: white; }
-        .ap-btn-mini.secondary { background: #f0f0f0; color: #666; }
+        @keyframes fadeUp { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+        @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+        @keyframes pulseRing { 0%,100%{box-shadow:0 0 0 0 currentColor} 50%{box-shadow:0 0 0 4px transparent} }
+        @keyframes expandIn { from{opacity:0;transform:scaleY(0.95)} to{opacity:1;transform:scaleY(1)} }
+        @keyframes dotBounce { 0%,60%,100%{transform:translateY(0)} 30%{transform:translateY(-3px)} }
+        @keyframes spinIn { from{transform:rotate(-90deg);opacity:0} to{transform:rotate(0);opacity:1} }
+        .fix-btn:hover { filter: brightness(0.95); }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 4px; }
       `}</style>
 
-      {/* Header */}
-      <div style={{ padding: '10px 13px', background: 'white', borderBottom: '1px solid #ebebeb', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div>
-          <div style={{ fontSize: 13, fontWeight: 700 }}>Workbook Audit</div>
-          <div style={{ fontSize: 10.5, color: '#a09e9c' }}>
-            {phase === 'scanning' && '⚡ Scanning…'}
-            {phase === 'enriching' && '✨ AI enriching…'}
-            {phase === 'fixing' && '🛠 Fixing all issues…'}
-            {phase === 'done' && `Done · ${issues.length} findings`}
-            {phase === 'idle' && 'Ready'}
+      {/* ── Header ── */}
+      <div style={{
+        padding: '12px 14px 10px',
+        background: '#fff',
+        borderBottom: '0.5px solid rgba(0,0,0,0.07)',
+        flexShrink: 0,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <h2 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: '#1a1a1a' }}>Workbook Audit</h2>
+              {lastRun && phase === 'done' && (
+                <span style={{ fontSize: 10, color: '#aaa', background: 'rgba(0,0,0,0.04)', padding: '2px 7px', borderRadius: 10 }}>
+                  {lastRun}
+                </span>
+              )}
+              {domain !== 'general' && phase === 'done' && (
+                <span style={{ fontSize: 10, color: '#8B5CF6', background: 'rgba(139,92,246,0.08)', padding: '2px 7px', borderRadius: 10, fontWeight: 600 }}>
+                  {domain.toUpperCase()}
+                </span>
+              )}
+            </div>
+            <p style={{ margin: '2px 0 0', fontSize: 10.5, color: '#aaa' }}>
+              {phase === 'scanning' ? '⚡ Running 15 local checks…'
+               : phase === 'enriching' ? '✦ AI adding business context…'
+               : phase === 'fixing' ? '⚙ Applying fixes…'
+               : phase === 'done' ? `${issues.length} finding${issues.length !== 1 ? 's' : ''}${fixableCount > 0 ? ` · ${fixableCount} fixable` : ''}`
+               : 'Ready to scan'}
+            </p>
           </div>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center' }}>
-          {healthScore !== null && <HealthRing score={healthScore} animated={animatedScore === healthScore} />}
-          <div className="ap-actions-mini">
-            <button className="ap-btn-mini secondary" onClick={runAudit} disabled={isRunning}><i className="ms-Icon ms-Icon--Refresh" /></button>
-            {issues.some(canAutoFix) && (
-              <button className="ap-btn-mini primary" onClick={handleFixAll} disabled={isRunning}>
-                <i className="ms-Icon ms-Icon--MagicWand" /> Fix All
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            {healthScore !== null && <ScoreRing score={healthScore} animated={animatedScore >= healthScore}/>}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+              <button
+                onClick={runAudit}
+                disabled={isRunning}
+                style={{
+                  background: isRunning ? 'rgba(0,0,0,0.05)' : '#1a1a1a',
+                  color: isRunning ? '#999' : '#fff',
+                  border: 'none', borderRadius: 7,
+                  padding: '5px 10px', fontSize: 11, fontWeight: 600,
+                  cursor: isRunning ? 'not-allowed' : 'pointer',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {isRunning ? '…' : '↻ Scan'}
               </button>
-            )}
+              {fixableCount > 0 && !isRunning && (
+                <button
+                  onClick={handleFixAll}
+                  style={{
+                    background: '#10B981', color: '#fff',
+                    border: 'none', borderRadius: 7,
+                    padding: '5px 10px', fontSize: 11, fontWeight: 600,
+                    cursor: 'pointer', whiteSpace: 'nowrap',
+                  }}
+                >
+                  ⚡ Fix All
+                </button>
+              )}
+            </div>
           </div>
         </div>
+
+        {/* Export row */}
+        {phase === 'done' && issues.length > 0 && (
+          <div style={{ marginTop: 8, display: 'flex', gap: 6 }}>
+            <button onClick={handleExportReport} style={{
+              fontSize: 10.5, padding: '4px 9px', borderRadius: 6, border: '0.5px solid rgba(0,0,0,0.1)',
+              background: copiedReport ? '#10B981' : 'transparent', color: copiedReport ? '#fff' : '#888',
+              cursor: 'pointer', fontWeight: 500, transition: 'all 0.2s',
+            }}>
+              {copiedReport ? '✓ Copied' : '⇩ Export Report'}
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* Stats row */}
-      {issues.length > 0 && (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6, padding: '8px 10px', background: '#f8f8f8' }}>
-          {[
-            { label: 'Errors', count: errors, filter: 'error', color: '#D92D20', bg: '#FEF3F2' },
-            { label: 'Warnings', count: warnings, filter: 'warning', color: '#DC6803', bg: '#FFFAEB' },
-            { label: 'Improvements', count: improvements, filter: 'improvement', color: '#0077B6', bg: '#EFF8FF' },
-          ].map(s => (
-            <div key={s.label} onClick={() => setActiveFilter(activeFilter === s.filter ? 'all' : s.filter)}
-              style={{ background: activeFilter === s.filter ? s.bg : 'white', borderRadius: 8, padding: '7px 10px', cursor: 'pointer', border: `1px solid ${activeFilter === s.filter ? s.color + '60' : '#ebebeb'}` }}>
-              <div style={{ fontSize: 18, fontWeight: 700, color: s.color }}>{s.count}</div>
-              <div style={{ fontSize: 9, color: '#888' }}>{s.label}</div>
-            </div>
-          ))}
+      {/* ── Phase Banner ── */}
+      <PhaseBanner phase={phase} progress={0}/>
+
+      {/* ── Fix All Progress ── */}
+      {phase === 'fixing' && fixProgress.total > 0 && (
+        <FixAllProgress total={fixProgress.total} done={fixProgress.done}/>
+      )}
+
+      {/* ── AI Summary Card ── */}
+      {healthScore !== null && phase !== 'scanning' && (
+        <div style={{ flexShrink: 0 }}>
+          <AISummary
+            score={animatedScore}
+            issueCount={issues.length}
+            domain={domain}
+            errors={errors}
+            warnings={warnings}
+            improvements={improvements}
+            narrative={narrative}
+          />
         </div>
       )}
 
-      {/* Issues list */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '10px' }}>
-        {phase === 'scanning' && <SkeletonCard delay={0} />}
+      {/* ── Filter Bar ── */}
+      {issues.length > 0 && (
+        <div style={{ flexShrink: 0 }}>
+          <FilterBar
+            activeFilter={activeFilter}
+            setActiveFilter={setActiveFilter}
+            search={search}
+            setSearch={setSearch}
+            issues={issues}
+          />
+        </div>
+      )}
+
+      {/* ── Issues List ── */}
+      <div 
+        ref={listRef} 
+        style={{ 
+          flex: 1, 
+          minHeight: 0, // Critical for flex scrolling
+          overflowY: 'scroll', // Force scrollbar to be visible
+          padding: '8px 10px 16px', 
+        }}
+      >
+        {phase === 'scanning' && (
+          <>
+            {[0, 80, 160, 240].map(d => <SkeletonCard key={d} delay={d}/>)}
+          </>
+        )}
+
         {filteredIssues.map((issue, idx) => (
           <IssueCard
             key={issue.id}
             issue={issue}
             idx={idx}
-            isExpanded={expandedId === idx}
+            expanded={expandedId === idx}
             onToggle={() => setExpandedId(expandedId === idx ? null : idx)}
             onNavigate={navigateToCell}
             onHighlight={highlightCells}
-            onCopyFormula={handleCopyFormula}
             onSmartFix={canAutoFix(issue) ? handleSmartFix : null}
             onRevertFix={issue.fixApplied ? handleRevertFix : null}
+            canFix={canAutoFix(issue)}
           />
         ))}
-        {phase === 'done' && filteredIssues.length === 0 && <div style={{ textAlign: 'center', padding: '20px', color: '#999' }}>All clear! ✅</div>}
+
+        {(phase === 'done' || phase === 'idle') && filteredIssues.length === 0 && (
+          <EmptyState phase={phase} hasRun={hasRun} onRun={runAudit} />
+        )}
       </div>
 
-      <div style={{ padding: '8px 10px', background: 'white', borderTop: '1px solid #ebebeb' }}>
-        <button onClick={runAudit} disabled={isRunning} style={{ width: '100%', background: '#1a1a1a', color: 'white', border: 'none', borderRadius: 6, padding: '10px', fontWeight: 600, cursor: 'pointer' }}>
-          {isRunning ? 'Processing...' : 'Run New Audit'}
-        </button>
-      </div>
     </div>
   );
 }
