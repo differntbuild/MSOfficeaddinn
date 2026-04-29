@@ -57,12 +57,141 @@ function pruneNoisyColumns(data) {
   if (lastActiveCol === -1) return data;
   const pruned = lastActiveCol + 1;
   if (pruned === data.columnCount) return data;
-  return { ...data, columnCount: pruned, headers: data.headers.slice(0, pruned) };
+  
+  let newAddress = data.address;
+  if (data.address && data.address.includes(':')) {
+    const oldRangeParts = data.address.split(':');
+    const startCell = oldRangeParts[0]; // e.g., 'Sheet1!A1'
+    const newEndCell = `${colLetter(pruned - 1)}${data.rowCount}`; // e.g., 'T501'
+    newAddress = `${startCell}:${newEndCell}`;
+  }
+
+  return { 
+    ...data, 
+    columnCount: pruned, 
+    headers: data.headers.slice(0, pruned),
+    address: newAddress
+  };
+}
+
+function pruneGhostRows(data, findings) {
+  const prunedValues = [data.values[0]]; // keep header
+  const ghostRows = [];
+  
+  for (let r = 1; r < data.rowCount; r++) {
+    let emptyCount = 0;
+    for (let c = 0; c < data.columnCount; c++) {
+      const val = data.values[r][c];
+      if (val === '' || val === null || val === undefined || String(val).trim() === '') {
+        emptyCount++;
+      }
+    }
+    if (emptyCount / data.columnCount > 0.95) {
+      ghostRows.push(r + 1); // 1-indexed row number
+    } else {
+      prunedValues.push(data.values[r]);
+    }
+  }
+
+  if (ghostRows.length > 0) {
+    findings.push({
+      title: `Pruned ${ghostRows.length} Empty Ghost Row${ghostRows.length > 1 ? 's' : ''}`,
+      desc: `Removed ${ghostRows.length} row${ghostRows.length > 1 ? 's' : ''} (e.g. Row ${ghostRows[0]}) that were >95% blank or contained only invisible spaces. These rows skew aggregations and trigger false positive missing-data warnings, but contain no actionable information.`,
+      loc: `Row ${ghostRows[0]}`,
+      type: 'improvement',
+      category: 'structure',
+      priority: 'low',
+      effort: 'easy',
+      affectedCount: ghostRows.length,
+    });
+  }
+
+  return { ...data, values: prunedValues, rowCount: prunedValues.length };
+}
+
+function coalesceColumns(data, findings) {
+  const groups = {};
+  
+  const normalize = (h) => h.toLowerCase().replace(/[^a-z]/g, '');
+  const getSemanticRoot = (h) => {
+    const clean = normalize(h);
+    if (clean.includes('email')) return 'email';
+    if (clean.includes('phone') || clean.includes('contact')) return 'phone';
+    if (clean.includes('address') || clean === 'addr' || clean === 'location') return 'address';
+    if (clean === 'id' || clean === 'id1' || clean.includes('empid') || clean.includes('employeeid')) return 'empid';
+    if (clean === 'product' || clean === 'productname') return 'product';
+    if (clean.includes('category')) return 'category';
+    if (clean.includes('rating')) return 'rating';
+    if (clean.includes('qty') || clean.includes('quantity')) return 'quantity';
+    if (clean.includes('rev')) return 'revenue';
+    if (clean.includes('dob')) return 'dob';
+    if (clean.includes('name')) return 'name';
+    return clean;
+  };
+
+  for (let c = 0; c < data.columnCount; c++) {
+    const header = data.headers[c];
+    if (!header) continue;
+    const root = getSemanticRoot(header);
+    if (root) {
+      if (!groups[root]) groups[root] = [];
+      groups[root].push(c);
+    }
+  }
+
+  const newValues = data.values.map(row => [...row]);
+  const newHeaders = [...data.headers];
+  const newFormulas = data.formulas ? data.formulas.map(row => [...row]) : null;
+
+  for (const [root, cols] of Object.entries(groups)) {
+    if (cols.length > 1) {
+      const primaryCol = cols[0];
+      const mergedNames = cols.map(c => data.headers[c]);
+      
+      for (let r = 1; r < data.rowCount; r++) {
+        let bestVal = '';
+        let bestForm = '';
+        for (const c of cols) {
+          const val = newValues[r][c];
+          if (val !== '' && val !== null && val !== undefined) {
+            bestVal = val;
+            if (newFormulas) bestForm = newFormulas[r][c];
+            break;
+          }
+        }
+        
+        newValues[r][primaryCol] = bestVal;
+        if (newFormulas) newFormulas[r][primaryCol] = bestForm;
+        
+        for (let i = 1; i < cols.length; i++) {
+          newValues[r][cols[i]] = '';
+          if (newFormulas) newFormulas[r][cols[i]] = '';
+        }
+      }
+      
+      for (let i = 1; i < cols.length; i++) {
+        newHeaders[cols[i]] = '';
+      }
+
+      findings.push({
+        title: `Semantically Merged ${cols.length} "${mergedNames[0]}" Columns`,
+        desc: `Consolidated data from ${cols.length} fragmented columns (${mergedNames.join(', ')}) into a single column. This prevents the audit engine from falsely penalizing the dataset for missing values in redundant/phantom columns.`,
+        loc: `${colLetter(cols[0])}1`,
+        type: 'improvement',
+        category: 'structure',
+        priority: 'low',
+        effort: 'easy',
+        affectedCount: cols.length,
+      });
+    }
+  }
+
+  return { ...data, values: newValues, headers: newHeaders, formulas: newFormulas };
 }
 
 // ─── Constants ──────────────────────────────────────────────────
 
-const Z_THRESHOLD = 2.8;
+
 
 const NON_NEGATIVE_PATTERNS = /\b(qty|quantity|price|amount|revenue|cost|cogs|age|count|units|sales|profit|stock|inventory|rate|score|hours|days|months|years)\b/i;
 const KEY_COL_PATTERNS = /\b(id|code|key|no|num|number|ref|reference|sku|order|invoice|employee|emp|customer|cust|product|serial)\b/i;
@@ -237,12 +366,17 @@ function checkOutliers(data) {
     if (!colStats || colStats.stdDev === 0 || colStats.count < 20) continue;
     const { mean, stdDev, max, min } = colStats;
 
+    const cv = mean === 0 ? 0 : Math.abs(stdDev / mean);
+    let dynamicThreshold = 2.8;
+    if (cv > 1.5) dynamicThreshold = 3.5;
+    else if (cv < 0.5) dynamicThreshold = 2.0;
+
     const flagged = [];
     for (let r = 1; r < data.rowCount; r++) {
       const val = data.values[r][c];
       if (typeof val !== 'number') continue;
       const z = Math.abs((val - mean) / stdDev);
-      if (z > Z_THRESHOLD) flagged.push({ addr: cellAddr(r, c), val, z: z.toFixed(1) });
+      if (z > dynamicThreshold) flagged.push({ addr: cellAddr(r, c), val, z: z.toFixed(1) });
     }
 
     if (flagged.length > 0 && flagged.length <= 15) {
@@ -252,7 +386,7 @@ function checkOutliers(data) {
       const deviationPct = Math.round(Math.abs(topOutlier.val - mean) / mean * 100);
       findings.push({
         title: `${flagged.length} Statistical Outlier${flagged.length > 1 ? 's' : ''} in "${header}" — Values Up to ${topOutlier.z}σ from Mean`,
-        desc: `"${header}" has a mean of ${fmt(mean)} (stdDev ${fmt(stdDev)}). ${flagged.length} value${flagged.length > 1 ? 's' : ''} exceed the ${Z_THRESHOLD}σ threshold (the sum of these specific outliers is ${fmt(sumOutliers)}) — the most extreme is ${fmt(topOutlier.val)} at ${topOutlier.addr}, which is ${deviationPct}% ${direction} average and ${topOutlier.z} standard deviations out. This is either a genuine exceptional event or a data entry error (e.g., an extra zero).`,
+        desc: `"${header}" has a mean of ${fmt(mean)} (stdDev ${fmt(stdDev)}). ${flagged.length} value${flagged.length > 1 ? 's' : ''} exceed the dynamic ${dynamicThreshold}σ threshold (the sum of these specific outliers is ${fmt(sumOutliers)}) — the most extreme is ${fmt(topOutlier.val)} at ${topOutlier.addr}, which is ${deviationPct}% ${direction} average and ${topOutlier.z} standard deviations out. This is either a genuine exceptional event or a data entry error (e.g., an extra zero).`,
         loc: topOutlier.addr,
         type: 'warning',
         category: 'outlier',
@@ -303,29 +437,69 @@ function checkNegativeValues(data) {
 
 function checkMissingValues(data) {
   const findings = [];
+  const keyCols = [];
+
   for (let c = 0; c < data.columnCount; c++) {
     const header = (data.headers[c] || '').toString();
     if (!KEY_COL_PATTERNS.test(header)) continue;
 
     const blanks = [];
+    const uniqueVals = new Set();
+    let nonBlanks = 0;
+
     for (let r = 1; r < data.rowCount; r++) {
       const val = data.values[r][c];
-      if (val === '' || val === null || val === undefined) blanks.push(cellAddr(r, c));
+      if (val === '' || val === null || val === undefined) {
+        blanks.push(cellAddr(r, c));
+      } else {
+        nonBlanks++;
+        uniqueVals.add(val);
+      }
     }
-    if (blanks.length === 0) continue;
 
-    const blankPct = Math.round((blanks.length / (data.rowCount - 1)) * 100);
-    findings.push({
-      title: `${blanks.length} Missing ${header} Values — ${blankPct}% of Rows Have No Primary Key`,
-      desc: `${blanks.length} row${blanks.length > 1 ? 's' : ''} (${blankPct}% of the dataset) have a blank "${header}" field (e.g. ${blanks.slice(0, 3).join(', ')}). Primary key columns must never be empty — these rows cannot be joined to other tables, will be excluded from XLOOKUP-based reports, and may cause duplicate-detection logic to incorrectly merge unrelated records.`,
-      loc: blanks.length === 1 ? blanks[0] : `${colLetter(c)}:${colLetter(c)}`,
-      type: 'error',
-      category: 'missing-value',
-      priority: 'critical',
-      effort: 'medium',
-      affectedCount: blanks.length,
-    });
+    const fillRate = data.rowCount > 1 ? nonBlanks / (data.rowCount - 1) : 0;
+    const uniqueness = nonBlanks > 0 ? uniqueVals.size / nonBlanks : 0;
+    const score = fillRate * uniqueness;
+
+    keyCols.push({ c, header, blanks, score });
   }
+
+  if (keyCols.length === 0) return findings;
+
+  keyCols.sort((a, b) => b.score - a.score);
+  const primaryKeyCol = keyCols[0];
+
+  for (const kc of keyCols) {
+    if (kc.blanks.length === 0) continue;
+
+    const blankPct = Math.round((kc.blanks.length / (data.rowCount - 1)) * 100);
+    const isPrimary = kc.c === primaryKeyCol.c;
+
+    if (isPrimary) {
+      findings.push({
+        title: `${kc.blanks.length} Missing ${kc.header} Values — ${blankPct}% of Rows Have No Primary Key`,
+        desc: `${kc.blanks.length} row${kc.blanks.length > 1 ? 's' : ''} (${blankPct}% of the dataset) have a blank "${kc.header}" field (e.g. ${kc.blanks.slice(0, 3).join(', ')}). Primary key columns must never be empty — these rows cannot be joined to other tables, will be excluded from XLOOKUP-based reports, and may cause duplicate-detection logic to incorrectly merge unrelated records.`,
+        loc: kc.blanks.length === 1 ? kc.blanks[0] : `${colLetter(kc.c)}:${colLetter(kc.c)}`,
+        type: 'error',
+        category: 'missing-value',
+        priority: 'critical',
+        effort: 'medium',
+        affectedCount: kc.blanks.length,
+      });
+    } else {
+      findings.push({
+        title: `${kc.blanks.length} Missing ${kc.header} Values — ${blankPct}% of Rows Are Unassigned`,
+        desc: `${kc.blanks.length} row${kc.blanks.length > 1 ? 's' : ''} (${blankPct}% of the dataset) have a blank "${kc.header}" field (e.g. ${kc.blanks.slice(0, 3).join(', ')}). Since this appears to be a secondary identifier or foreign key, missing values may be valid (e.g., an unassigned product), but they will drop out of any PivotTables or groupings based on this column.`,
+        loc: kc.blanks.length === 1 ? kc.blanks[0] : `${colLetter(kc.c)}:${colLetter(kc.c)}`,
+        type: 'warning',
+        category: 'missing-value',
+        priority: 'medium',
+        effort: 'medium',
+        affectedCount: kc.blanks.length,
+      });
+    }
+  }
+
   return findings;
 }
 
@@ -634,28 +808,106 @@ export const generateAuditNarrative = (findings, domain, score) => {
  * @param {Object} data  — full sheet context from useOffice()
  * @returns {Array}      — finding objects
  */
-export const runLocalAudit = (data) => {
-  const prunedData = pruneNoisyColumns(data);
+function checkBusinessLogic(data) {
+  const findings = [];
+  
+  let discountCol = -1, marginCol = -1, gstCol = -1, categoryCol = -1, returnCol = -1;
+  for (let c = 0; c < data.columnCount; c++) {
+    const h = (data.headers[c] || '').toLowerCase();
+    if (h.includes('discount') && h.includes('%')) discountCol = c;
+    if (h.includes('margin') && h.includes('%')) marginCol = c;
+    if (h.includes('gst') || h.includes('tax')) gstCol = c;
+    if (h.includes('category') || h.includes('segment')) categoryCol = c;
+    if (h.includes('return') || h.includes('refund')) returnCol = c;
+  }
 
-  const checks = [
-    checkMissingHeaders,
+  // Margin Violations
+  if (discountCol !== -1 && marginCol !== -1) {
+    let violationCount = 0, example = null;
+    for (let r = 1; r < data.rowCount; r++) {
+      const disc = parseFloat(data.values[r][discountCol]);
+      const marg = parseFloat(data.values[r][marginCol]);
+      if (!isNaN(disc) && !isNaN(marg) && disc > marg) {
+        violationCount++;
+        if (!example) example = cellAddr(r, discountCol);
+      }
+    }
+    if (violationCount > 0) {
+      findings.push({
+        title: `Margin Violation: ${violationCount} Order${violationCount > 1 ? 's' : ''} Where Discount Exceeds Gross Margin`,
+        desc: `Found ${violationCount} row${violationCount > 1 ? 's' : ''} (e.g. at ${example}) where the discount percentage is higher than the gross margin percentage, resulting in a net loss on the sale.`,
+        loc: example,
+        type: 'warning',
+        category: 'business-logic',
+        priority: 'high',
+        effort: 'medium',
+        affectedCount: violationCount,
+      });
+    }
+  }
+
+  // Tax/GST Anomalies
+  if (gstCol !== -1) {
+    let anomalyCount = 0, example = null;
+    const validSlabs = [0, 5, 12, 18, 28];
+    for (let r = 1; r < data.rowCount; r++) {
+      let gst = parseFloat(data.values[r][gstCol]);
+      if (isNaN(gst)) continue;
+      if (gst > 0 && gst < 1) gst = gst * 100;
+      gst = Math.round(gst);
+      if (!validSlabs.includes(gst)) {
+        anomalyCount++;
+        if (!example) example = cellAddr(r, gstCol);
+      }
+    }
+    if (anomalyCount > 0) {
+      findings.push({
+        title: `GST Compliance Risk: ${anomalyCount} Invalid Tax Rate${anomalyCount > 1 ? 's' : ''}`,
+        desc: `Found ${anomalyCount} row${anomalyCount > 1 ? 's' : ''} (e.g. at ${example}) where the GST rate does not match standard Indian tax slabs (0%, 5%, 12%, 18%, 28%). This could lead to compliance issues during tax filing.`,
+        loc: example,
+        type: 'error',
+        category: 'business-logic',
+        priority: 'critical',
+        effort: 'easy',
+        affectedCount: anomalyCount,
+      });
+    }
+  }
+
+  return findings;
+}
+
+export const runLocalAudit = (data) => {
+  let rawFindings = [];
+  let prunedData = pruneNoisyColumns(data);
+  prunedData = pruneGhostRows(prunedData, rawFindings);
+  prunedData = coalesceColumns(prunedData, rawFindings);
+
+  const hasFormulas = prunedData.formulas && prunedData.formulas.some(row => row && row.some(f => typeof f === 'string' && f.startsWith('=')));
+  
+  const formulaChecks = hasFormulas ? [
     checkFormulaErrors,
-    checkMissingValues,
-    checkDuplicates,
-    checkTypeMismatch,
-    checkNegativeValues,
     checkInconsistentFormulas,
     checkUnprotectedLookups,
     checkVolatileFunctions,
     checkMagicNumbers,
+    checkOldFunctions,
+  ] : [];
+
+  const checks = [
+    checkMissingHeaders,
+    ...formulaChecks,
+    checkMissingValues,
+    checkDuplicates,
+    checkTypeMismatch,
+    checkNegativeValues,
     checkTrailingSpaces,
     checkOutliers,
     checkDataCompleteness,
-    checkOldFunctions,
     checkTableFormat,
+    checkBusinessLogic,
   ];
 
-  let rawFindings = [];
   for (const check of checks) {
     try {
       rawFindings = [...rawFindings, ...check(prunedData)];

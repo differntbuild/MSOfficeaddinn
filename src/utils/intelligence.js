@@ -150,6 +150,7 @@ For EACH input finding, you must:
 7. Set "action_type" to one of: fix | create_dashboard | external_enrich | investigate | None.
 
 CRITICAL RULE: DO NOT invent new findings. You must ONLY enrich the findings provided in the "findings" array. Never create "ai-001" or any new IDs.
+CRITICAL RULE: Your JSON output MUST contain EXACTLY the same number of items as the input "findings" array. You are an enricher, not a filter. Do not drop or combine any findings.
 CRITICAL RULE: When calculating impact for outliers or errors, DO NOT simply multiply the maximum outlier value by the count of outliers (this is statistically invalid). Explain the potential range logically.
 
 ═══════════════════════════════════
