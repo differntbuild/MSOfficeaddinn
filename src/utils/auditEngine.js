@@ -46,7 +46,9 @@ function pruneNoisyColumns(data) {
     const hasHeader = header !== '';
     let hasData = false;
     for (let r = 1; r < data.rowCount; r++) {
-      const val = data.values[r][c];
+      const row = data.values[r];
+      if (!row) continue;
+      const val = row[c];
       if (val !== '' && val !== null && val !== undefined && String(val).trim() !== '') { 
         hasData = true; 
         break; 
@@ -74,15 +76,71 @@ function pruneNoisyColumns(data) {
   };
 }
 
+function pruneNoisyRows(data) {
+  let lastActiveRow = 0; // Header is row 0
+  for (let r = data.rowCount - 1; r >= 1; r--) {
+    const row = data.values[r];
+    if (!row) continue;
+    
+    let hasData = false;
+    for (let c = 0; c < data.columnCount; c++) {
+      const val = row[c];
+      if (val !== '' && val !== null && val !== undefined && String(val).trim() !== '') {
+        hasData = true;
+        break;
+      }
+    }
+    if (hasData) {
+      lastActiveRow = r;
+      break;
+    }
+  }
+
+  if (lastActiveRow === data.rowCount - 1) return data;
+  
+  const pruned = lastActiveRow + 1;
+  const prunedValues = data.values.slice(0, pruned);
+  const prunedFormulas = data.formulas ? data.formulas.slice(0, pruned) : null;
+
+  let newAddress = data.address;
+  if (data.address && data.address.includes(':')) {
+    const parts = data.address.split(':');
+    const startCell = parts[0];
+    const sheetPrefix = startCell.includes('!') ? startCell.split('!')[0] + '!' : '';
+    const startCoords = startCell.split('!').pop();
+    const startCol = startCoords.replace(/[0-9]/g, '');
+    const newEndCell = `${colLetter(data.columnCount - 1)}${pruned}`;
+    newAddress = `${startCell}:${sheetPrefix}${startCol}${startCoords.replace(/[A-Z]/g, '') === '1' ? '' : startCoords.replace(/[A-Z]/g, '')}${newEndCell}`; // This is getting complex, let's simplify
+    // Simplest way: if it's A1:AE1048576, just make it A1:AE[pruned]
+    const colPart = colLetter(data.columnCount - 1);
+    newAddress = `${startCell}:${colPart}${pruned}`;
+  }
+
+  return {
+    ...data,
+    values: prunedValues,
+    formulas: prunedFormulas,
+    rowCount: pruned,
+    address: newAddress
+  };
+}
+
 function pruneGhostRows(data, findings) {
   const prunedValues = [data.values[0]]; // keep header
   const prunedFormulas = data.formulas ? [data.formulas[0]] : null;
   const ghostRows = [];
   
+  // We only call it a "Ghost Row" if there is data AFTER it.
+  // Otherwise, it was just trailing space (which pruneNoisyRows handles).
   for (let r = 1; r < data.rowCount; r++) {
+    const row = data.values[r];
+    if (!row) {
+      ghostRows.push(r + 1);
+      continue;
+    }
     let emptyCount = 0;
     for (let c = 0; c < data.columnCount; c++) {
-      const val = data.values[r][c];
+      const val = row[c];
       if (val === '' || val === null || val === undefined || String(val).trim() === '') {
         emptyCount++;
       }
@@ -97,8 +155,8 @@ function pruneGhostRows(data, findings) {
 
   if (ghostRows.length > 0) {
     findings.push({
-      title: `Pruned ${ghostRows.length} Empty Ghost Row${ghostRows.length > 1 ? 's' : ''}`,
-      desc: `Removed ${ghostRows.length} row${ghostRows.length > 1 ? 's' : ''} (e.g. Row ${ghostRows[0]}) that were >95% blank or contained only invisible spaces. These rows skew aggregations and trigger false positive missing-data warnings, but contain no actionable information.`,
+      title: `Pruned ${ghostRows.length} Sparse Ghost Row${ghostRows.length > 1 ? 's' : ''}`,
+      desc: `Detected ${ghostRows.length} nearly-empty row${ghostRows.length > 1 ? 's' : ''} (e.g. Row ${ghostRows[0]}) interspersed within your data range. These "ghost rows" are often invisible artifacts of deleted data that can corrupt pivot table counts and trigger false-positive missing-data warnings. They have been safely excluded from this analysis.`,
       loc: `Row ${ghostRows[0]}`,
       type: 'improvement',
       category: 'structure',
@@ -117,18 +175,24 @@ function coalesceColumns(data, findings) {
   const normalize = (h) => h.toLowerCase().replace(/[^a-z]/g, '');
   const getSemanticRoot = (h) => {
     const clean = normalize(h);
+    
+    // EXCLUSION: Prevent over-merging of hierarchical or meta data
+    if (clean.includes('sub') || clean.includes('parent') || clean.includes('meta') || clean.includes('child')) {
+      return null; 
+    }
+
     if (clean.includes('email')) return 'email';
-    if (clean.includes('phone') || clean.includes('contact')) return 'phone';
-    if (clean.includes('address') || clean === 'addr' || clean === 'location') return 'address';
-    if (clean === 'id' || clean === 'id1' || clean.includes('empid') || clean.includes('employeeid')) return 'empid';
+    if (clean.includes('phone') || clean === 'contact') return 'phone';
+    if (clean === 'address' || clean === 'addr' || clean === 'location') return 'address';
+    if (clean === 'id' || clean === 'id1' || clean === 'empid' || clean === 'employeeid') return 'empid';
     if (clean === 'product' || clean === 'productname') return 'product';
-    if (clean.includes('category')) return 'category';
-    if (clean.includes('rating')) return 'rating';
-    if (clean.includes('qty') || clean.includes('quantity')) return 'quantity';
-    if (clean.includes('rev')) return 'revenue';
-    if (clean.includes('dob')) return 'dob';
-    if (clean.includes('name')) return 'name';
-    return clean;
+    if (clean === 'category' || clean === 'cat') return 'category';
+    if (clean === 'rating') return 'rating';
+    if (clean === 'qty' || clean === 'quantity') return 'quantity';
+    if (clean.includes('revenue') || clean === 'rev') return 'revenue';
+    if (clean === 'dob' || clean === 'birthdate') return 'dob';
+    if (clean === 'name' || clean === 'fullname') return 'name';
+    return null; // Don't guess for unknown roots
   };
 
   for (let c = 0; c < data.columnCount; c++) {
@@ -154,20 +218,24 @@ function coalesceColumns(data, findings) {
         let bestVal = '';
         let bestForm = '';
         for (const c of cols) {
-          const val = newValues[r][c];
+          const rowVal = newValues[r];
+          const rowForm = newFormulas ? newFormulas[r] : null;
+          if (!rowVal) continue;
+          
+          const val = rowVal[c];
           if (val !== '' && val !== null && val !== undefined) {
             bestVal = val;
-            if (newFormulas) bestForm = newFormulas[r][c];
+            if (rowForm) bestForm = rowForm[c];
             break;
           }
         }
         
-        newValues[r][primaryCol] = bestVal;
-        if (newFormulas) newFormulas[r][primaryCol] = bestForm;
+        if (newValues[r]) newValues[r][primaryCol] = bestVal;
+        if (newFormulas && newFormulas[r]) newFormulas[r][primaryCol] = bestForm;
         
         for (let i = 1; i < cols.length; i++) {
-          newValues[r][cols[i]] = '';
-          if (newFormulas) newFormulas[r][cols[i]] = '';
+          if (newValues[r]) newValues[r][cols[i]] = '';
+          if (newFormulas && newFormulas[r]) newFormulas[r][cols[i]] = '';
         }
       }
       
@@ -211,8 +279,10 @@ function checkFormulaErrors(data) {
   // Group errors by type and column for concise, high-signal reporting
   const byTypeCol = {};
   for (let r = 1; r < data.rowCount; r++) {
+    const row = data.values[r];
+    if (!row) continue;
     for (let c = 0; c < data.columnCount; c++) {
-      const val = data.values[r][c];
+      const val = row[c];
       if (typeof val === 'string' && ERRORS.includes(val.trim())) {
         const key = `${val.trim()}|${c}`;
         if (!byTypeCol[key]) byTypeCol[key] = { errType: val.trim(), col: c, cells: [] };
@@ -668,7 +738,7 @@ function checkTableFormat(data) {
       loc: data.address,
       type: 'improvement',
       category: 'improvement',
-      priority: 'low',
+      priority: 'medium',
       effort: 'easy',
       affectedCount: data.rowCount,
     });
@@ -881,8 +951,15 @@ function checkBusinessLogic(data) {
 
 export const runLocalAudit = (data) => {
   let rawFindings = [];
+  
+  // Phase 0: Pruning & Normalization
+  // 1. Truncate trailing empty columns
   let prunedData = pruneNoisyColumns(data);
+  // 2. Truncate trailing empty rows (silently)
+  prunedData = pruneNoisyRows(prunedData);
+  // 3. Remove interspersed "ghost" rows (with finding)
   prunedData = pruneGhostRows(prunedData, rawFindings);
+  // 4. Merge semantic duplicates
   prunedData = coalesceColumns(prunedData, rawFindings);
 
   const hasFormulas = prunedData.formulas && prunedData.formulas.some(row => row && row.some(f => typeof f === 'string' && f.startsWith('=')));
@@ -932,4 +1009,63 @@ export const runLocalAudit = (data) => {
   deduped.sort((a, b) => (priorityOrder[a.priority] ?? 4) - (priorityOrder[b.priority] ?? 4));
 
   return deduped.map((f, i) => ({ ...f, id: `finding-${i + 1}` }));
+};
+
+/**
+ * Generates a Data Profile for the LLM "Coder" pass.
+ * Extracts schema, samples, and summary stats without sending full data.
+ */
+export const generateDataProfile = (data) => {
+  const profile = {
+    rowCount: data.rowCount,
+    colCount: data.columnCount,
+    headers: data.headers,
+    types: {},
+    stats: {},
+    sample: data.values.slice(1, 6), // First 5 rows of data
+    address: data.address,
+    sheetName: data.sheetName
+  };
+
+  data.headers.forEach((h, i) => {
+    let type = 'string';
+    let nullCount = 0;
+    let min = Infinity, max = -Infinity;
+    let numericCount = 0;
+
+    for (let r = 1; r < data.rowCount; r++) {
+      const row = data.values[r];
+      if (!row) { nullCount++; continue; }
+      const val = row[i];
+      if (val === '' || val === null || val === undefined) {
+        nullCount++;
+        continue;
+      }
+      
+      if (typeof val === 'number') {
+        type = 'number';
+        numericCount++;
+        if (val < min) min = val;
+        if (val > max) max = val;
+      }
+    }
+
+    profile.types[h] = type;
+    profile.stats[h] = {
+      nullCount,
+      nullPct: Math.round((nullCount / Math.max(1, data.rowCount)) * 100) + '%'
+    };
+
+    if (numericCount > 0 && min !== Infinity) {
+      profile.stats[h].min = min;
+      profile.stats[h].max = max;
+    }
+  });
+
+  // Sanitize sample to avoid [object Object] or null issues
+  profile.sample = profile.sample.map(row => 
+    row ? row.map(v => v === null || v === undefined ? "" : v) : []
+  );
+
+  return profile;
 };

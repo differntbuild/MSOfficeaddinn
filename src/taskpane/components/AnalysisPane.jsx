@@ -1,9 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useOffice } from '../hooks/useOffice';
+import { usePython } from '../hooks/usePython';
 import { streamChat } from '../hooks/useGroq';
 import { getSystemPromptForIntent, detectDomain } from '../../utils/intelligence';
 import { runLocalAudit, computeHealthScore, generateAuditNarrative } from '../../utils/auditEngine';
 import { ActionExecutor } from '../../agent/engine/ActionExecutor';
+import { AuditEngine } from '../../agent/engine/AuditEngine';
 
 /* ─── Sanitize AI nulls ─── */
 const aiVal = (v) => (v === null || v === undefined || v === 'null' || v === '' ? null : v);
@@ -512,7 +514,14 @@ export default function AnalysisPane({ host }) {
   const abortRef = useRef(false);
   const listRef = useRef(null);
 
+  const { isReady: pythonReady, isLoading: pythonLoading, loadRuntime, runAnalysis } = usePython();
   const executor = useMemo(() => new ActionExecutor(officeOps), [officeOps]);
+  const auditEngine = useMemo(() => new AuditEngine({ 
+    streamChat, 
+    host, 
+    domain, 
+    getSystemPromptForIntent 
+  }), [host, domain]);
 
   /* Score animation */
   useEffect(() => {
@@ -572,98 +581,44 @@ export default function AnalysisPane({ host }) {
     setNarrative('');
 
     try {
+      // Initialize Python if not ready
+      if (!pythonReady) {
+        setPhase('scanning'); // Keep status at scanning while loading
+        await loadRuntime();
+      }
+
       const data = await getFullSheetContext();
       const detectedDomain = detectDomain(data.headers, data.sheetName);
       setDomain(detectedDomain);
 
-      // Phase 1: Local checks
-      const localFindings = runLocalAudit(data);
-      const score = computeHealthScore(localFindings);
-
-      // Generate local narrative immediately — will be updated if AI enriches
-      const localNarrative = generateAuditNarrative(localFindings, detectedDomain, score);
-      setNarrative(localNarrative);
-      setIssues(localFindings.map(f => ({ ...f, aiEnriched: false })));
-      setHealthScore(score);
-      setPhase('enriching');
-
-      if (localFindings.length === 0) {
-        setPhase('done');
-        setLastRun(new Date().toLocaleTimeString());
-        return;
-      }
-
-      // Phase 2: AI enrichment — send rich context including stats, column types, and sample
-      const systemMsg = getSystemPromptForIntent('AUDIT', { host, domain: detectedDomain });
-
-      const enrichPrompt = JSON.stringify({
-        findings: localFindings.map(f => ({
-          id: f.id,
-          title: f.title,
-          loc: f.loc,
-          category: f.category,
-          type: f.type,
-          desc: f.desc,
-          priority: f.priority,
-          affectedCount: f.affectedCount,
-        })),
-        stats: data.stats,
-        headers: data.headers,
-        columnTypes: data.columnTypes,
-        totalRows: data.rowCount - 1,
-        domain: detectedDomain,
-        sheetName: data.sheetName || 'Sheet1',
-        isTable: data.isTable,
+      // Execute Agentic Audit
+      const result = await auditEngine.executeAudit(data, {
+        onStatus: (msg) => {
+          if (msg.includes('Python')) setPhase('scanning');
+          else setPhase('enriching');
+          setNarrative(msg);
+        },
+        runPython: runAnalysis
       });
 
-      await streamChat(enrichPrompt, null, systemMsg, (fullText) => {
-        if (abortRef.current) return;
-        const startIdx = fullText.indexOf('[');
-        const endIdx = fullText.lastIndexOf(']');
-        if (startIdx === -1 || (endIdx !== -1 && endIdx < startIdx)) return;
-        const jsonText = endIdx === -1
-          ? fullText.substring(startIdx)
-          : fullText.substring(startIdx, endIdx + 1);
-        try {
-          const enrichments = JSON.parse(jsonText);
-          if (!Array.isArray(enrichments)) return;
-          setIssues(prev => {
-            const next = [...prev];
-            enrichments.forEach(e => {
-              const idx = next.findIndex(i => i.id === e.id);
-              if (idx !== -1) {
-                // Prefer AI's richer title/desc if provided (AI may upgrade them)
-                next[idx] = {
-                  ...next[idx],
-                  title: aiVal(e.title) || next[idx].title,
-                  desc: aiVal(e.desc) || next[idx].desc,
-                  impact: aiVal(e.impact) || next[idx].impact,
-                  recommendation: aiVal(e.recommendation) || next[idx].recommendation,
-                  suggested_formula: aiVal(e.suggested_formula) || next[idx].suggested_formula,
-                  action_type: e.action_type || next[idx].action_type,
-                  dashboard_config: e.dashboard_config || next[idx].dashboard_config,
-                  priority: e.priority || next[idx].priority,
-                  aiEnriched: true,
-                };
-              }
-            });
-            // Re-generate narrative after AI enrichment to reflect any new findings
-            const updatedScore = computeHealthScore(next);
-            setNarrative(generateAuditNarrative(next, detectedDomain, updatedScore));
-            return next;
+      if (result.ok && result.report) {
+        setIssues(result.report.findings);
+        setHealthScore(result.report.health_score);
+        setNarrative(result.report.summary);
+        
+        if (window.Office) {
+          await saveToWorkbookMemory('lastAudit', {
+            timestamp: new Date().toISOString(),
+            score: result.report.health_score,
+            issueCount: result.report.findings.length,
           });
-        } catch {
-          // Partial JSON during streaming — wait for next chunk
         }
-      });
+      } else {
+        throw new Error(result.error || 'Audit failed to return results.');
+      }
 
       setPhase('done');
       setLastRun(new Date().toLocaleTimeString());
-      if (window.Office) {
-        await saveToWorkbookMemory('lastAudit', {
-          timestamp: new Date().toISOString(), score, issueCount: localFindings.length,
-        });
-      }
     } catch (err) {
       setIssues([{
         id: 'err-0',
@@ -855,22 +810,24 @@ export default function AnalysisPane({ host }) {
                   ⚡ Fix All
                 </button>
               )}
+              {issues.length > 0 && (
+                <button 
+                  onClick={handleExportReport} 
+                  style={{
+                    fontSize: 11, padding: '5px 10px', borderRadius: 7, 
+                    border: '0.5px solid rgba(0,0,0,0.1)',
+                    background: copiedReport ? '#10B981' : '#fff', 
+                    color: copiedReport ? '#fff' : '#555',
+                    cursor: 'pointer', fontWeight: 600, transition: 'all 0.2s',
+                  }}
+                >
+                  {copiedReport ? '✓' : '⇩ Report'}
+                </button>
+              )}
             </div>
           </div>
         </div>
 
-        {/* Export row */}
-        {phase === 'done' && issues.length > 0 && (
-          <div style={{ marginTop: 8, display: 'flex', gap: 6 }}>
-            <button onClick={handleExportReport} style={{
-              fontSize: 10.5, padding: '4px 9px', borderRadius: 6, border: '0.5px solid rgba(0,0,0,0.1)',
-              background: copiedReport ? '#10B981' : 'transparent', color: copiedReport ? '#fff' : '#888',
-              cursor: 'pointer', fontWeight: 500, transition: 'all 0.2s',
-            }}>
-              {copiedReport ? '✓ Copied' : '⇩ Export Report'}
-            </button>
-          </div>
-        )}
       </div>
 
       {/* ── Phase Banner ── */}

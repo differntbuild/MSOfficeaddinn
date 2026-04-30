@@ -25,6 +25,9 @@
   </DefaultSettings>
 
   <Permissions>ReadWriteDocument</Permissions>
+  <AppDomains>
+    <AppDomain>https://api.groq.com</AppDomain>
+  </AppDomains>
 
   <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
     <Hosts>

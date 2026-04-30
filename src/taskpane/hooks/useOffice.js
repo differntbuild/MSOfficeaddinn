@@ -155,7 +155,7 @@ export const useOffice = () => {
     return await Excel.run(async (context) => {
       const sheet = context.workbook.worksheets.getActiveWorksheet();
       sheet.load('name');
-      const range = sheet.getUsedRange();
+      const range = sheet.getUsedRange(true);
       range.load(['values', 'formulas', 'address', 'rowCount', 'columnCount', 'numberFormat']);
       
       const namedItems = context.workbook.names;
@@ -376,7 +376,8 @@ export const useOffice = () => {
   const convertRangeToTable = useCallback(async (address) => {
     return await Excel.run(async (context) => {
       const sheet = context.workbook.worksheets.getActiveWorksheet();
-      const range = address ? sheet.getRange(address) : sheet.getUsedRange();
+      const cleanAddress = address && address.includes('!') ? address.split('!')[1] : address;
+      const range = cleanAddress ? sheet.getRange(cleanAddress) : sheet.getUsedRange();
       
       const tables = sheet.tables;
       tables.load("items/address");
